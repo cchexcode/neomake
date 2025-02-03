@@ -1,24 +1,24 @@
-version: "0.5"
+version: "0.6"
 
 nodes:
   count:
     matrix:
-      dense:
-        drop: "^(1,1)$" # drop cell [1,1]
-        dimensions:
-          - - env:
+      parallel: true
+      dimensions:
+        - - env:
+              vars:
                 X: "0"
-            - env:
+          - env:
+              vars:
                 X: "1"
-          - - env:
+        - - env:
+              vars:
                 Y: "0"
-            - env:
+          - env:
+              vars:
                 Y: "1"
     tasks:
-      - shell:
-          program: "python3"
-          args:
-            - "-c"
+      - shell: "python3 -c"
         script: |
           import time
           import os

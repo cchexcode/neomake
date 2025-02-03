@@ -24,10 +24,11 @@ impl ExecutionEngine {
     }
 
     pub fn execute(&self, plan: &plan::ExecutionPlan, workers: usize) -> Result<()> {
+        #[derive(Debug)]
         struct Work {
             workdir: Option<String>,
             env: HashMap<String, String>,
-            shell: plan::Shell,
+            shell: String,
             command: String,
         }
 
@@ -38,8 +39,10 @@ impl ExecutionEngine {
 
             let nodes = stage.nodes.iter().map(|v| plan.nodes.get(v).unwrap());
             for node in nodes {
-                for matrix in &node.invocations {
-                    let mut work = Vec::<Work>::new();
+                let mut batches = Vec::<Vec<Work>>::new();
+                let mut current_batch = Vec::<Work>::new();
+
+                for invoke in &node.invocations {
                     for task in &node.tasks {
                         let workdir = if let Some(workdir) = &task.workdir {
                             Some(workdir.to_owned())
@@ -54,39 +57,51 @@ impl ExecutionEngine {
                         } else if let Some(shell) = &node.shell {
                             shell.to_owned()
                         } else {
-                            crate::plan::Shell {
-                                program: "sh".to_owned(),
-                                args: vec!["-c".to_owned()],
-                            }
+                            "/bin/sh -c".to_owned()
                         };
 
                         let mut env = plan.env.clone();
                         env.extend(node.env.clone());
-                        env.extend(matrix.env.clone());
+                        env.extend(invoke.env.clone());
                         env.extend(task.env.clone());
 
-                        signal_cnt += 1;
-                        work.push(Work {
+                        current_batch.push(Work {
                             command: task.cmd.clone(),
                             env,
                             shell,
                             workdir,
                         })
                     }
+                }
 
-                    let output = self.output.clone();
-                    // executes matrix entry
-                    for w in work {
-                        let t_tx = signal_tx.clone();
-                        pool.execute(move || {
-                            let res = move || -> Result<()> {
-                                let mut cmd_proc = std::process::Command::new(w.shell.program);
-                                cmd_proc.args(w.shell.args);
-                                cmd_proc.envs(w.env);
-                                if let Some(w) = w.workdir {
+                // add all items as individual batches if parallel is allowed
+                if node.parallel {
+                    signal_cnt += current_batch.len();
+                    for w in current_batch {
+                        batches.push(vec![w]);
+                    }
+                } else {
+                    signal_cnt += 1;
+                    batches.push(current_batch);
+                }
+
+                let output = self.output.clone();
+                // executes matrix entry
+                for batch in batches {
+                    let t_tx = signal_tx.clone();
+                    pool.execute(move || {
+                        let res = move || -> Result<()> {
+                            for work in batch {
+                                let mut shell = work.shell.split_whitespace();
+                                let mut cmd_proc = std::process::Command::new(shell.next().unwrap());
+                                while let Some(v) = shell.next() {
+                                    cmd_proc.arg(v);
+                                }
+                                cmd_proc.envs(work.env);
+                                if let Some(w) = work.workdir {
                                     cmd_proc.current_dir(w);
                                 }
-                                cmd_proc.arg(&w.command);
+                                cmd_proc.arg(&work.command);
                                 cmd_proc.stdin(Stdio::null());
 
                                 if !output.stdout {
@@ -103,16 +118,16 @@ impl ExecutionEngine {
                                     | v => {
                                         Err(anyhow::anyhow!(
                                             "command: {} failed to execute with code {}",
-                                            w.command,
+                                            work.command,
                                             v
                                         ))
                                     },
                                 }?;
-                                Ok(())
-                            }();
-                            t_tx.send(res).expect("send failed");
-                        });
-                    }
+                            }
+                            Ok(())
+                        }();
+                        t_tx.send(res).expect("send failed");
+                    });
                 }
             }
 

@@ -1,4 +1,4 @@
-version: "0.5"
+version: "0.6"
 
 env:
   capture: "^(PWD)$"
@@ -8,26 +8,28 @@ env:
 nodes:
   count:
     matrix:
-      dense:
-        drop: "^(0,0,0|1,1,1)$"
-        dimensions:
-          - - env:
+      parallel: false
+      dimensions:
+        - - env:
+              vars:
                 X: "0"
-            - env:
+          - env:
+              vars:
                 X: "1"
-          - - env:
+        - - env:
+              vars:
                 Y: "0"
-            - env:
+          - env:
+              vars:
                 Y: "1"
-          - - env:
+        - - env:
+              vars:
                 Z: "0"
-            - env:
+          - env:
+              vars:
                 Z: "1"
     tasks:
-      - shell:
-          program: "python3"
-          args:
-            - "-c"
+      - shell: "python3 -c"
         script: |
           import time
           import os
@@ -41,15 +43,19 @@ nodes:
 
   print:
     matrix:
-      dense:
-        dimensions:
-          - - env:
+      parallel: true
+      dimensions:
+        - - env:
+              vars:
                 X: "0"
-            - env:
+          - env:
+              vars:
                 X: "1"
-          - - env:
+        - - env:
+              vars:
                 Y: "0"
-            - env:
+          - env:
+              vars:
                 Y: "1"
     tasks:
       - script: |
@@ -63,7 +69,7 @@ nodes:
 
   bravo: # with predecessor
     pre:
-      - alpha
+      - name: alpha
     tasks:
       - script: |
           set -e
@@ -71,15 +77,18 @@ nodes:
 
   charlie: # environment variables
     env:
-      ENV_NODE: val_node
+      vars:
+        ENV_NODE: val_node
     matrix:
-      dense:
-        dimensions:
-          - - env:
+      parallel: true
+      dimensions:
+        - - env:
+              vars:
                 ENV_MATRIX: "val_matrix"
     tasks:
       - env:
-          ENV_TASK: val_task
+          vars:
+            ENV_TASK: val_task
         script: |
           set -e
           printf "$ENV_GLOBAL\n"
@@ -89,15 +98,19 @@ nodes:
 
   delta: # matrix
     matrix:
-      dense:
-        dimensions:
-          - - env:
+      parallel: true
+      dimensions:
+        - - env:
+              vars:
                 X: "0"
-            - env:
+          - env:
+              vars:
                 X: "1"
-          - - env:
+        - - env:
+              vars:
                 Y: "0"
-            - env:
+          - env:
+              vars:
                 Y: "1"
     tasks:
       - script: |
@@ -116,18 +129,12 @@ nodes:
           ls -al1 .
 
   foxtrot: # shell
-    shell:
-      program: "/bin/bash"
-      args:
-        - "-c"
+    shell: "/bin/bash -c"
     tasks:
       - script: |
           set -e
           printf "$0"
-      - shell:
-          program: "/bin/sh"
-          args:
-            - "-c"
+      - shell: "/bin/sh -c"
         script: |
           set -e
           printf "$0"

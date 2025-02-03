@@ -87,14 +87,11 @@ impl Env {
     }
 }
 
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-/// A task execution environment.
-pub(crate) struct Shell {
-    /// The program (like "/bin/bash").
-    pub program: String,
-    /// Custom args (like \["-c"\]).
-    pub args: Vec<String>,
+pub(crate) enum NodeSelector {
+    Name(String),
+    Regex(String),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -104,7 +101,7 @@ pub(crate) struct Node {
     /// A description of this node.
     pub description: Option<String>,
     /// Reference nodes that need to be executed prior to this one.
-    pub pre: Option<Vec<String>>,
+    pub pre: Option<Vec<NodeSelector>>,
 
     /// An n-dimensional matrix that is executed for every item in its cartesian
     /// product.
@@ -113,43 +110,27 @@ pub(crate) struct Node {
     pub tasks: Vec<Task>,
 
     /// Env vars.
-    pub env: Option<HashMap<String, String>>,
+    pub env: Option<Env>,
     /// Custom program to execute the scripts.
-    pub shell: Option<Shell>,
+    pub shell: Option<String>,
     /// Custom workdir.
     pub workdir: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 /// An entry in the n-dimensional matrix for the node execution.
-pub(crate) enum Matrix {
-    Dense {
-        drop: Option<String>,
-        dimensions: Vec<Vec<MatrixCell>>,
-    },
-    Sparse {
-        dimensions: Vec<Vec<MatrixCell>>,
-        keep: Option<String>,
-    },
+pub(crate) struct Matrix {
+    pub parallel: bool,
+    pub dimensions: Vec<Vec<MatrixCell>>,
 }
 
 impl Matrix {
     pub(crate) fn compile(&self) -> Result<Vec<crate::plan::Invocation>> {
-        let (dimensions, regex) = match self {
-            | Self::Dense { drop, dimensions } => (dimensions, drop),
-            | Self::Sparse { keep, dimensions } => (dimensions, keep),
-        };
-
-        let regex = match regex {
-            | Some(v) => Some(fancy_regex::Regex::new(&v)?),
-            | None => None,
-        };
-
         // Bake the coords in their respective dimension into the struct itself.
         // This makes coord finding for regex (later) a breeze.
-        let dims_widx = dimensions.iter().map(|d_x| {
-            let mut y = 0usize;
+        let dims_widx = self.dimensions.iter().map(|d_x| {
+            let mut y = 0_u8;
             d_x.iter()
                 .map(|d_y| {
                     y += 1;
@@ -162,39 +143,16 @@ impl Matrix {
         let mut v = Vec::<crate::plan::Invocation>::new();
 
         for next in cp {
-            let coords = next.iter().map(|v| format!("{}", v.0)).join(",");
-
-            match self {
-                | Self::Dense { .. } => {
-                    if let Some(regex) = &regex {
-                        // drop all that match
-                        if regex.is_match(&format!("{}", coords))? {
-                            continue;
-                        }
-                    } else { // keep all
-                    };
-                },
-                | Self::Sparse { .. } => {
-                    if let Some(regex) = &regex {
-                        // drop all that do not match
-                        if !regex.is_match(&format!("{}", coords))? {
-                            continue;
-                        }
-                    } else {
-                        // drop all
-                        continue;
-                    };
-                },
-            }
+            let cell = next.iter().map(|v| v.0).collect::<Vec<_>>();
 
             let mut env = HashMap::<String, String>::new();
             for m in next {
                 if let Some(e) = &m.1.env {
-                    env.extend(e.clone());
+                    env.extend(e.compile()?);
                 }
             }
 
-            v.push(crate::plan::Invocation { env, coords });
+            v.push(crate::plan::Invocation { env, cell });
         }
         Ok(v)
     }
@@ -205,7 +163,7 @@ impl Matrix {
 /// An entry in the n-dimensional matrix for the node execution.
 pub(crate) struct MatrixCell {
     /// Environment variables.
-    pub env: Option<HashMap<String, String>>,
+    pub env: Option<Env>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -216,9 +174,9 @@ pub(crate) struct Task {
     pub script: String,
 
     /// Explicitly set env vars.
-    pub env: Option<HashMap<String, String>>,
+    pub env: Option<Env>,
     /// Custom program to execute the scripts.
-    pub shell: Option<Shell>,
+    pub shell: Option<String>,
     /// Custom workdir.
     pub workdir: Option<String>,
 }

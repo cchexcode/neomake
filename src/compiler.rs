@@ -1,7 +1,10 @@
 use {
     crate::{
         plan,
-        workflow::Workflow,
+        workflow::{
+            NodeSelector,
+            Workflow,
+        },
     },
     anyhow::Result,
     std::{
@@ -30,6 +33,7 @@ impl Compiler {
         let stages = self.determine_order(nodes)?;
 
         let mut plan = plan::ExecutionPlan {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
             stages: vec![],
             nodes: HashMap::<_, _>::new(),
             env: match &self.workflow.env {
@@ -43,14 +47,18 @@ impl Compiler {
             for node in stage {
                 let node_def = &self.workflow.nodes[&node];
                 let mut rendered_node = plan::Node {
+                    parallel: match &node_def.matrix {
+                        | Some(v) => v.parallel,
+                        | None => false,
+                    },
                     invocations: vec![],
                     tasks: vec![],
                     env: match &node_def.env {
-                        | Some(v) => v.clone(),
+                        | Some(v) => v.compile()?,
                         | None => HashMap::<_, _>::new(),
                     },
-                    shell: match node_def.shell.clone() {
-                        | Some(v) => Some(v.into()),
+                    shell: match &node_def.shell {
+                        | Some(v) => Some(v.clone()),
                         | None => None,
                     },
                     workdir: node_def.workdir.clone(),
@@ -69,7 +77,7 @@ impl Compiler {
                             | None => None,
                         },
                         env: match task.env.clone() {
-                            | Some(v) => v,
+                            | Some(v) => v.compile()?,
                             | None => HashMap::<_, _>::new(),
                         },
                         workdir: task.workdir.clone(),
@@ -109,7 +117,28 @@ impl Compiler {
                 OutputNode {
                     name: c.0.to_owned(),
                     description: c.1.description.clone(),
-                    pre: c.1.pre.clone(),
+                    pre: match &c.1.pre {
+                        | Some(v) => {
+                            let mut pre_nodes = Vec::<String>::new();
+                            for v in v {
+                                match &v {
+                                    | NodeSelector::Name(v) => {
+                                        pre_nodes.push(v.clone());
+                                    },
+                                    | NodeSelector::Regex(v) => {
+                                        let regex = fancy_regex::Regex::new(v).unwrap();
+                                        for n in self.workflow.nodes.keys() {
+                                            if regex.is_match(n).unwrap() {
+                                                pre_nodes.push(n.clone());
+                                            }
+                                        }
+                                    },
+                                }
+                            }
+                            Some(pre_nodes)
+                        },
+                        | None => None,
+                    },
                 }
             })),
         };
@@ -188,12 +217,28 @@ impl Compiler {
 
             let c = self.workflow.nodes.get(&next);
             if c.is_none() {
-                return Err(anyhow::anyhow!(next));
+                return Err(anyhow::anyhow!("node not found: {}", next));
             }
 
             if let Some(pre) = &c.unwrap().pre {
-                map.insert(next, pre.clone());
-                pending.extend(pre.clone());
+                let mut pre_nodes = Vec::<String>::new();
+                for sel in pre {
+                    match &sel {
+                        | NodeSelector::Name(v) => {
+                            pre_nodes.push(v.clone());
+                        },
+                        | NodeSelector::Regex(v) => {
+                            let regex = fancy_regex::Regex::new(v).unwrap();
+                            for n in self.workflow.nodes.keys() {
+                                if regex.is_match(n).unwrap() {
+                                    pre_nodes.push(n.clone());
+                                }
+                            }
+                        },
+                    }
+                }
+                map.insert(next, pre_nodes.clone());
+                pending.extend(pre_nodes);
             } else {
                 map.insert(next, Vec::<String>::new());
             }

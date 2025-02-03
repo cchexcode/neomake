@@ -1,0 +1,43 @@
+version: "0.0"
+
+nodes:
+  "build:docs":
+    tasks:
+      - script: |
+          cargo doc --no-deps --document-private-items
+
+  "build:program":
+    matrix:
+      parallel: false
+      dimensions:
+        - - {}
+          - env:
+              vars:
+                RELEASE: --release
+        # json
+        - - {}
+          - env:
+              vars:
+                F_JSON: --features format+json
+        # ron
+        - - {}
+          - env:
+              vars:
+                F_RON: --features format+ron
+    tasks:
+      - script: |
+          set -e
+          export CARGO_FLAGS="$F_JSON $F_RON $RELEASE"
+          echo cargo flags: \"$CARGO_FLAGS\"
+          cargo build $CARGO_FLAGS
+
+  test:
+    tasks:
+      - script: |
+          cargo test --no-fail-fast
+
+  hook:pre-push:
+    pre:
+      - regex: "^build:"
+      - name: test
+    tasks: []

@@ -12,13 +12,13 @@
 ## Features
 
 - **DAG execution**\
-  Tasks are run in nodes. Nodes can be chained together to create a DAG. Simply specify all the nodes you want executed and it will automagically create the DAG based on the defined dependencies.
+  Nodes can be chained together to create a DAG. Simply specify all the nodes you want executed and it will automagically create the DAG based on the defined dependencies.
 - **Parallel task execution**\
-  The DAG generations are called stages. Stages are executed in sequence while all tasks inside of the stages are executed in parallel. Workloads are executed in OS threads. The default size of the threadpool is 1 but can be configured.
+  The DAG generations are called stages. Stages are executed in sequence. Workloads are executed in OS threads. The default size of the threadpool is 1 but can be configured.
 - **Matrix invocations**\
-  Specify n-dimensional matrices that are used to invoke the node many times. You can define dense and sparse matrices. The node will be executed for every element in the cartesion product of the matrix.
+  Specify n-dimensional matrices that are used to invoke the node many times. The node will be executed for every element in the cartesion product of the matrix.
 - **YAML**\
-  No need for any fancy configuration formats or syntax. The entire configuration is done in an easy to understand `yaml` file, including support for handy features such as YAML anchors (and everything in the `YAML 1.2` standard).
+  No need for any custom configuration formats or syntax. The entire configuration is done in an easy to understand `yaml` file, including support for handy features such as YAML anchors (and everything in the `YAML 1.2` standard).
 - **Customizable environment**\
   You can customize which shell or program (such as bash or python) `neomake` uses as interpreter for the command. You can also specify arguments that are provided per invocation via the command line, working directories and environment variables on multiple different levels. Generally, values defined in the inner scope will extend and replace the outer scope.
 - **Plan & execute**\
@@ -38,19 +38,19 @@
 First, initialize an example workflow file with the following command.
 
 ```bash
-neomake workflow init -tpython
+neomake workflow init -t python
 ```
 
 Now, execute the `count` node. Per default, `neomake` will only use exactly one worker thread and execute the endless embedded python program.
 
 ```bash
-neomake plan -ccount | neomake x
+neomake plan -n count | neomake x
 ```
 
 In order to work on all 4 desired executions (defined as 2x2 matrix), call neomake with the number of worker threads desired. Now you will see that the 4 programs will be executed in parallel.
 
 ```bash
-neomake plan -ccount | neomake x -w4
+neomake plan -n count | neomake x -w4
 ```
 
 ## Graph execution
@@ -58,7 +58,7 @@ neomake plan -ccount | neomake x -w4
 Execute nodes as follows.
 
 ```bash
-neomake plan -f ./test/.neomake.yaml -c bravo -c charlie -oron | neomake execute -fron
+neomake plan -f ./test/neomake.yaml -n bravo -n charlie -o ron+p | neomake execute -f ron
 ```
 
 Nodes can define an array of dependenies (other nodes) that need to be executed beforehand. All node executions are deduplicated so that every node is only executed exactly once if requested for invocation or as a prerequisite on any level to any node that is to be executed. Alongside the ability to specify multiple node to be executed per command line call, this feature allows for complex workflows to be executed.\
@@ -75,14 +75,14 @@ nodes:
   - name: B
   - name: C
     pre:
-      - A
+      - name: A
   - name: D
     pre:
-      - B
+      - name: B
   - name: E
     pre:
-      - A
-      - D
+      - name: A
+      - name: D
 ```
 
 In words, `A` and `B` are nodes without any prerequisites whereas `C` depends on `A` and `D` depends on `B`. Notably, `E` depends on both `A` and `D`. This means that `E` also transiently depends on any dependencies of `A` (`{}`) and `D` (`{B}`).
@@ -170,7 +170,7 @@ I built this utility because all of the alternatives I have tried, including the
 ## Example configuration
 
 ```yaml
-<-- ../res/templates/max.neomake.yaml -->
+<-- ../res/templates/maxneomake.yaml -->
 ```
 
 For more examples, call `neomake workflow init --help` or look at the schema with `neomake workflow schema`.

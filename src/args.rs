@@ -61,8 +61,6 @@ pub(crate) enum Format {
     JSON {
         pretty: bool,
     },
-    #[cfg(feature = "format+toml")]
-    TOML,
     #[cfg(feature = "format+ron")]
     RON {
         pretty: bool,
@@ -81,8 +79,6 @@ impl Format {
                     Ok(serde_json::to_string(arg)?)
                 }
             },
-            #[cfg(feature = "format+toml")]
-            | crate::args::Format::TOML => Ok(toml::to_string(arg)?),
             #[cfg(feature = "format+ron")]
             | crate::args::Format::RON { pretty } => {
                 if *pretty {
@@ -90,7 +86,7 @@ impl Format {
                         arg,
                         ron::ser::PrettyConfig::new()
                             .compact_arrays(true)
-                            .enumerate_arrays(true)
+                            .enumerate_arrays(false)
                             .new_line("\n".to_owned()), // no windows on my turf
                     )?)
                 } else {
@@ -105,8 +101,6 @@ impl Format {
             | crate::args::Format::YAML => Ok(serde_yaml::from_str::<T>(s)?),
             #[cfg(feature = "format+json")]
             | crate::args::Format::JSON { .. } => Ok(serde_json::from_str::<T>(s)?),
-            #[cfg(feature = "format+toml")]
-            | crate::args::Format::TOML => Ok(toml::from_str::<T>(s)?),
             #[cfg(feature = "format+ron")]
             | crate::args::Format::RON { .. } => Ok(ron::from_str::<T>(s)?),
         }
@@ -119,8 +113,6 @@ impl Format {
             | "json" => Ok(Format::JSON { pretty: false }),
             #[cfg(feature = "format+json")]
             | "json+p" => Ok(Format::JSON { pretty: true }),
-            #[cfg(feature = "format+toml")]
-            | "toml" => Ok(Format::TOML),
             #[cfg(feature = "format+ron")]
             | "ron" => Ok(Format::RON { pretty: false }),
             #[cfg(feature = "format+ron")]
@@ -221,7 +213,11 @@ pub(crate) enum Command {
         root: String,
     },
     Multiplex {
+        program: Vec<String>,
+        stdout: Option<Format>,
+        stderr: usize,
         commands: Vec<String>,
+        parallelism: Option<usize>,
     },
 }
 
@@ -233,8 +229,6 @@ impl ClapArgumentLoader {
         let mut output_formats = vec!["yaml"];
         #[cfg(feature = "format+json")]
         output_formats.extend(["json", "json+p"]);
-        #[cfg(feature = "format+toml")]
-        output_formats.push("toml");
         #[cfg(feature = "format+ron")]
         output_formats.extend(["ron", "ron+p"]);
         // strip format modifiers ("+\w")
@@ -243,8 +237,8 @@ impl ClapArgumentLoader {
 
         clap::Command::new("neomake")
             .version(env!("CARGO_PKG_VERSION"))
-            .about("A makefile alternative / task runner.")
-            .author("replicadse <aw@voidpointergroup.com>")
+            .about("A rusty makefile alternative / task runner.")
+            .author("cchexcode <alexanderh.weber@outlook.com>")
             .propagate_version(true)
             .subcommand_required(true)
             .args([Arg::new("experimental")
@@ -283,7 +277,7 @@ impl ClapArgumentLoader {
                         Arg::new("workflow")
                             .long("workflow")
                             .help("The workflow file to use.")
-                            .default_value("./.neomake.yaml"),
+                            .default_value("./neomake.yaml"),
                     )
                     .arg(clap::Arg::new("watch").short('w').long("watch").required(true))
                     .arg(clap::Arg::new("root").short('r').long("root").default_value("./"))
@@ -320,7 +314,7 @@ impl ClapArgumentLoader {
                                     .short('o')
                                     .long("output")
                                     .help("The file to render the output to. \"-\" renders to STDOUT.")
-                                    .default_value("./.neomake.yaml"),
+                                    .default_value("./neomake.yaml"),
                             ),
                     )
                     .subcommand(clap::Command::new("schema").about("Renders the workflow schema to STDOUT.")),
@@ -333,7 +327,7 @@ impl ClapArgumentLoader {
                         Arg::new("workflow")
                             .long("workflow")
                             .help("The workflow file to use.")
-                            .default_value("./.neomake.yaml"),
+                            .default_value("./neomake.yaml"),
                     )
                     .arg(
                         Arg::new("node")
@@ -414,7 +408,7 @@ impl ClapArgumentLoader {
                         Arg::new("workflow")
                             .long("workflow")
                             .help("The workflow file to use.")
-                            .default_value("./.neomake.yaml"),
+                            .default_value("./neomake.yaml"),
                     )
                     .arg(
                         Arg::new("node")
@@ -450,7 +444,7 @@ impl ClapArgumentLoader {
                         clap::Arg::new("workflow")
                             .long("workflow")
                             .help("The workflow file to use.")
-                            .default_value("./.neomake.yaml"),
+                            .default_value("./neomake.yaml"),
                     )
                     .arg(
                         Arg::new("output")
@@ -465,17 +459,32 @@ impl ClapArgumentLoader {
                 clap::Command::new("multiplex")
                     .about("Multiplex commands")
                     .visible_aliases(&["m", "mp"])
-                    .arg(
+                    .args([
+                        clap::Arg::new("program")
+                            .long("program")
+                            .help("Defines the program used to execute the commands given.")
+                            .default_value("/bin/sh -c"),
+                        clap::Arg::new("stderr")
+                            .long("stderr")
+                            .help("Defines the length of stderr to display.")
+                            .default_value("3"),
+                        clap::Arg::new("stdout")
+                            .long("stdout")
+                            .help(
+                                "Marks whether the stdout of the processes are captured and returned in a structured \
+                                 format to stdout.",
+                            )
+                            .value_parser(output_formats.clone()),
+                        clap::Arg::new("parallelism")
+                            .long("parallelism")
+                            .short('p')
+                            .help("Set the maximum amount of (sub) processes that run in parallel."),
                         clap::Arg::new("command")
                             .short('c')
                             .long("command")
                             .help("A command to be executed.")
                             .action(ArgAction::Append),
-                    )
-                    .arg(clap::Arg::new("file").short('f').long("file").help(
-                        "Define a commands file. The content will be split per line, which are then interpreted as \
-                         individual commands.",
-                    )),
+                    ]),
             )
     }
 
@@ -590,18 +599,32 @@ impl ClapArgumentLoader {
                 root: x.get_one::<String>("root").unwrap().to_owned(),
             }
         } else if let Some(x) = command.subcommand_matches("multiplex") {
-            let mut commands = x
+            let commands = x
                 .get_many::<String>("command")
                 .unwrap_or_default()
                 .cloned()
                 .collect_vec();
-            if let Some(file) = x.get_one::<String>("file") {
-                let mut content = String::new();
-                std::fs::File::open(file)?.read_to_string(&mut content)?;
-                let lines = &mut content.lines().map(|v| v.to_owned()).collect::<Vec<_>>();
-                commands.append(lines);
+
+            let program = x
+                .get_one::<String>("program")
+                .unwrap()
+                .split_whitespace()
+                .into_iter()
+                .map(|v| v.to_owned())
+                .collect::<Vec<_>>();
+            Command::Multiplex {
+                program,
+                stderr: x.get_one::<String>("stderr").unwrap().parse::<usize>()?,
+                stdout: match x.get_one::<String>("stdout") {
+                    | Some(v) => Some(Format::from_arg(v)?),
+                    | None => None,
+                },
+                commands,
+                parallelism: match x.get_one::<String>("parallelism") {
+                    | Some(v) => Some(v.parse::<usize>().unwrap()),
+                    | None => None,
+                },
             }
-            Command::Multiplex { commands }
         } else {
             return Err(anyhow::anyhow!("unknown command"));
         };
