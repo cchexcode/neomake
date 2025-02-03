@@ -1,8 +1,10 @@
 use {
-    crate::error::Error,
     anyhow::Result,
     itertools::Itertools,
-    std::collections::HashMap,
+    std::{
+        collections::HashMap,
+        path::Path,
+    },
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -11,6 +13,7 @@ use {
 pub(crate) struct Workflow {
     /// The version of this workflow file (major.minor).
     pub version: String,
+
     /// Env vars.
     pub env: Option<Env>,
 
@@ -25,28 +28,30 @@ pub(crate) struct Workflow {
 }
 
 impl Workflow {
-    pub fn load(data: &str) -> Result<Self> {
+    pub fn load<P: AsRef<Path>>(file: P) -> Result<Self> {
+        let data = std::fs::read_to_string(&file)?;
+
         #[derive(Debug, serde::Deserialize)]
         struct Versioned {
             version: String,
         }
-        let v = serde_yaml::from_str::<Versioned>(data)?;
+        let v = serde_yaml::from_str::<Versioned>(&data)?;
 
         let major_minor = env!("CARGO_PKG_VERSION").split(".").take(2).join(".");
         if &major_minor != "0.0" && &v.version != &major_minor {
             // major.minor must equal
-            Err(Error::VersionCompatibility(format!(
+            Err(anyhow::anyhow!(
                 "workflow version {} is incompatible with this CLI version {}",
                 v.version,
                 env!("CARGO_PKG_VERSION")
-            )))?
+            ))?
         }
 
         let wf: crate::workflow::Workflow = serde_yaml::from_str(&data)?;
-        let nodes_allow_regex = fancy_regex::Regex::new(r"^[a-zA-Z0-9_-]+$")?;
+        let nodes_allow_regex = fancy_regex::Regex::new(r"^[a-zA-Z0-9:_-]+$")?;
         for node in wf.nodes.keys() {
             if !nodes_allow_regex.is_match(node)? {
-                Err(Error::InvalidNodeName(node.clone()))?
+                Err(anyhow::anyhow!("invalid node name: {}", node))?
             }
         }
         Ok(wf)

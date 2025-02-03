@@ -1,6 +1,5 @@
 use {
     crate::{
-        error::Error,
         plan::ExecutionPlan,
         workflow::Workflow,
     },
@@ -40,8 +39,8 @@ impl CallArgs {
         }
 
         match &self.command {
-            | Command::Multiplex { .. } => Err(Error::ExperimentalCommand("multiplex".to_owned()))?,
-            | Command::Watch { .. } => Err(Error::ExperimentalCommand("watch".to_owned()))?,
+            | Command::Multiplex { .. } => Err(anyhow::anyhow!("experimental command: multiplex"))?,
+            | Command::Watch { .. } => Err(anyhow::anyhow!("experimental command: watch"))?,
             | _ => (),
         }
 
@@ -126,7 +125,7 @@ impl Format {
             | "ron" => Ok(Format::RON { pretty: false }),
             #[cfg(feature = "format+ron")]
             | "ron+p" => Ok(Format::RON { pretty: true }),
-            | _ => Err(Error::Argument("output".to_owned()).into()),
+            | _ => Err(anyhow::anyhow!("unknown format")),
         }
     }
 }
@@ -502,7 +501,7 @@ impl ClapArgumentLoader {
                 format: match subc.get_one::<String>("format").unwrap().as_str() {
                     | "manpages" => ManualFormat::Manpages,
                     | "markdown" => ManualFormat::Markdown,
-                    | _ => return Err(Error::Argument("unknown format".into()).into()),
+                    | _ => return Err(anyhow::anyhow!("argument \"format\": unknown format")),
                 },
             }
         } else if let Some(subc) = command.subcommand_matches("autocomplete") {
@@ -517,7 +516,7 @@ impl ClapArgumentLoader {
                         | "min" => InitTemplate::Min,
                         | "max" => InitTemplate::Max,
                         | "python" => InitTemplate::Python,
-                        | _ => return Err(Error::Argument("unknown template".into()).into()),
+                        | _ => return Err(anyhow::anyhow!("argument \"template\": unknown template")),
                     },
                     output: match x.get_one::<String>("output").unwrap().as_str() {
                         | "-" => InitOutput::Stdout,
@@ -527,7 +526,7 @@ impl ClapArgumentLoader {
             } else if let Some(_) = x.subcommand_matches("schema") {
                 Command::WorkflowSchema
             } else {
-                return Err(Error::UnknownCommand.into());
+                return Err(anyhow::anyhow!("unknown command"));
             }
         } else if let Some(x) = command.subcommand_matches("execute") {
             let mut args_map: HashMap<String, String> = HashMap::new();
@@ -558,19 +557,19 @@ impl ClapArgumentLoader {
             }
 
             Command::Plan {
-                workflow: std::fs::read_to_string(x.get_one::<String>("workflow").unwrap())?,
+                workflow: x.get_one::<String>("workflow").unwrap().clone(),
                 nodes: parse_nodes(x),
                 args: args_map,
                 format: Format::from_arg(x.get_one::<String>("output").unwrap().as_str())?,
             }
         } else if let Some(x) = command.subcommand_matches("list") {
             Command::List {
-                workflow: std::fs::read_to_string(x.get_one::<String>("workflow").unwrap())?,
+                workflow: x.get_one::<String>("workflow").unwrap().clone(),
                 format: Format::from_arg(x.get_one::<String>("output").unwrap().as_str())?,
             }
         } else if let Some(x) = command.subcommand_matches("describe") {
             Command::Describe {
-                workflow: std::fs::read_to_string(x.get_one::<String>("workflow").unwrap())?,
+                workflow: x.get_one::<String>("workflow").unwrap().clone(),
                 nodes: parse_nodes(x),
                 format: Format::from_arg(x.get_one::<String>("output").unwrap().as_str())?,
             }
@@ -584,7 +583,7 @@ impl ClapArgumentLoader {
             }
 
             Command::Watch {
-                workflow: std::fs::read_to_string(x.get_one::<String>("workflow").unwrap())?,
+                workflow: x.get_one::<String>("workflow").unwrap().clone(),
                 watch: x.get_one::<String>("watch").unwrap().to_owned(),
                 args: args_map,
                 workers: str::parse::<usize>(x.get_one::<String>("workers").unwrap()).unwrap(),
@@ -604,7 +603,7 @@ impl ClapArgumentLoader {
             }
             Command::Multiplex { commands }
         } else {
-            return Err(Error::UnknownCommand.into());
+            return Err(anyhow::anyhow!("unknown command"));
         };
 
         let callargs = CallArgs {

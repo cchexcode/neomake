@@ -1,8 +1,5 @@
 use {
-    crate::{
-        error::Error,
-        plan,
-    },
+    crate::plan,
     anyhow::Result,
     std::{
         collections::HashMap,
@@ -104,10 +101,11 @@ impl ExecutionEngine {
                                 match output.status.code().unwrap() {
                                     | 0 => Ok(()),
                                     | v => {
-                                        Err(Error::ChildProcess(format!(
+                                        Err(anyhow::anyhow!(
                                             "command: {} failed to execute with code {}",
-                                            w.command, v
-                                        )))
+                                            w.command,
+                                            v
+                                        ))
                                     },
                                 }?;
                                 Ok(())
@@ -123,9 +121,10 @@ impl ExecutionEngine {
                 .take(signal_cnt)
                 .filter(|x| x.is_err())
                 .map(|x| x.expect_err("expecting an err"))
+                .map(|v| v.to_string())
                 .collect::<Vec<_>>();
             if errs.len() > 0 {
-                return Err(Error::Many(errs).into());
+                return Err(anyhow::anyhow!("{}", errs.join("\n")).into());
                 // abort at this stage
             }
         }

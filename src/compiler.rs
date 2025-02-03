@@ -1,6 +1,5 @@
 use {
     crate::{
-        error::Error,
         plan,
         workflow::Workflow,
     },
@@ -189,7 +188,7 @@ impl Compiler {
 
             let c = self.workflow.nodes.get(&next);
             if c.is_none() {
-                return Err(Error::NotFound(next.to_owned()).into());
+                return Err(anyhow::anyhow!(next));
             }
 
             if let Some(pre) = &c.unwrap().pre {
@@ -222,7 +221,7 @@ impl Compiler {
             }
 
             if leafs.len() == 0 {
-                return Err(Error::NodeRecursion.into());
+                return Err(anyhow::anyhow!("found recursion in dag"));
             }
             let set = leafs.iter().map(|x| x.0.clone());
             seen.extend(set.clone());

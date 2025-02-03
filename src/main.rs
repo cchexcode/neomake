@@ -34,7 +34,6 @@ use {
         sync::{
             Arc,
             Mutex,
-            RwLock,
         },
         thread::sleep,
         time::Duration,
@@ -49,11 +48,8 @@ use {
     workflow::WatchExecStep,
 };
 
-include!("check_features.rs");
-
 pub mod args;
 pub mod compiler;
-pub mod error;
 pub mod exec;
 pub mod plan;
 pub mod reference;
@@ -238,13 +234,10 @@ async fn main() -> Result<()> {
                     if let Some(v) = v.get(&watch) {
                         v
                     } else {
-                        Err(crate::error::Error::NotFound(format!(
-                            "no watch node named {} in config",
-                            watch
-                        )))?
+                        Err(anyhow::anyhow!("no watch node named {} in config", watch))?
                     }
                 },
-                | None => Err(crate::error::Error::NotFound("no watch node in config".to_owned()))?,
+                | None => Err(anyhow::anyhow!("no watch node in config"))?,
             };
             let nodes = match &watch.exec {
                 | WatchExecStep::Node { ref_ } => Nodes::Arr(HashSet::<String>::from_iter([ref_.clone()])),
