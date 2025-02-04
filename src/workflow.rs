@@ -22,9 +22,6 @@ pub(crate) struct Workflow {
     #[schemars(with = "HashMap<String, Node>")]
     /// All nodes.
     pub nodes: HashMap<String, Node>,
-
-    /// All watch nodes.
-    pub watch: Option<HashMap<String, WatchExec>>,
 }
 
 impl Workflow {
@@ -179,30 +176,4 @@ pub(crate) struct Task {
     pub shell: Option<String>,
     /// Custom workdir.
     pub workdir: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-/// Watch definition.
-pub(crate) struct WatchExec {
-    /// Regex filter.
-    pub filter: String,
-    /// Whether to process all messages or skip processing as long as one is
-    /// running.
-    pub queue: bool,
-    /// Execution steps.
-    #[serde(with = "serde_yaml::with::singleton_map_recursive")]
-    #[schemars(with = "WatchExecStep")]
-    pub exec: WatchExecStep,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-/// Single execution step.
-pub(crate) enum WatchExecStep {
-    /// Reference and call a node.
-    Node {
-        #[serde(rename = "ref")]
-        ref_: String,
-    },
 }

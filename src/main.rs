@@ -1,20 +1,17 @@
 use {
-    args::Nodes,
+    bobr::multiplexer::Multiplexer,
     notify::{
         RecommendedWatcher,
         Watcher,
     },
-    std::{
-        cell::Cell,
-        collections::HashSet,
-        ops::Deref,
-        path::Path,
-        sync::{
-            Arc,
-            Mutex,
+    signal_hook::{
+        consts::{
+            SIGINT,
+            SIGTERM,
         },
+        iterator::Signals,
     },
-    workflow::WatchExecStep,
+    std::path::Path,
 };
 
 pub mod args;
@@ -139,41 +136,28 @@ async fn main() -> Result<()> {
             Ok(())
         },
         | crate::args::Command::Watch {
-            workflow,
-            watch,
-            args,
-            workers,
+            commands,
+            filter,
+            parallelism,
+            program,
             root,
+            stderr,
         } => {
-            let w = Workflow::load(&workflow)?;
-            let watch = match &w.watch {
-                | Some(v) => {
-                    if let Some(v) = v.get(&watch) {
-                        v
-                    } else {
-                        Err(anyhow::anyhow!("no watch node named {} in config", watch))?
-                    }
-                },
-                | None => Err(anyhow::anyhow!("no watch node in config"))?,
-            };
-            let nodes = match &watch.exec {
-                | WatchExecStep::Node { ref_ } => Nodes::Arr(HashSet::<String>::from_iter([ref_.clone()])),
-            };
-            let nodes = nodes.select(&w)?;
-            let regex = fancy_regex::Regex::new(&watch.filter)?;
-            let exec_state = Arc::new(if watch.queue {
-                None
-            } else {
-                Some(Mutex::new(Cell::new(false)))
-            });
-            let c = Compiler::new(w);
-            let exec_engine = Arc::new(ExecutionEngine::new(OutputMode {
-                stdout: true,
-                stderr: true,
-            }));
+            let regex = fancy_regex::Regex::new(&filter)?;
             let trim_path =
                 std::fs::canonicalize(&root).unwrap().to_str().unwrap().to_owned() + std::path::MAIN_SEPARATOR_STR;
-            let exec_state_callback = exec_state.clone();
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            tokio::spawn(async move {
+                let program = program.clone();
+                let commands = commands.clone();
+                while let Some(_) = rx.recv().await {
+                    Multiplexer::new(program.clone(), stderr, commands.clone(), parallelism.unwrap_or(1))
+                        .run()
+                        .await
+                        .unwrap();
+                }
+            });
 
             let mut watcher = RecommendedWatcher::new(
                 move |result: Result<notify::Event, notify::Error>| {
@@ -270,33 +254,7 @@ async fn main() -> Result<()> {
                             let event_path = e.paths[0].to_str().unwrap().trim_start_matches(&trim_path);
                             let filter = format!("{}|{}", &event_kind, &event_path);
                             if regex.is_match(&filter).unwrap() {
-                                match exec_state_callback.deref() {
-                                    | Some(v) => {
-                                        let state_lock = v.lock().unwrap();
-                                        if state_lock.get() {
-                                            return;
-                                        }
-                                        state_lock.set(true);
-                                    },
-                                    | None => {},
-                                }
-
-                                let mut args_new = args.clone();
-                                args_new.insert("EVENT".to_owned(), filter);
-                                args_new.insert("EVENT_KIND".to_owned(), event_kind.to_owned());
-                                args_new.insert("EVENT_PATH".to_owned(), event_path.to_owned());
-                                let plan = c.plan(&nodes, &args_new).unwrap();
-                                let exec_engine_thread = exec_engine.clone();
-                                let state_thread = exec_state_callback.clone();
-                                std::thread::spawn(move || {
-                                    exec_engine_thread.execute(&plan, workers).unwrap();
-                                    match state_thread.deref() {
-                                        | Some(v) => {
-                                            v.lock().unwrap().set(false);
-                                        },
-                                        | None => {},
-                                    }
-                                });
+                                tx.send(filter).unwrap();
                             }
                         },
                         | Err(e) => {
@@ -306,8 +264,10 @@ async fn main() -> Result<()> {
                 },
                 notify::Config::default(),
             )?;
+
             watcher.watch(Path::new(&root), notify::RecursiveMode::Recursive)?;
-            loop {}
+            Signals::new([SIGINT, SIGTERM]).unwrap().wait();
+            Ok(())
         },
     }
 }

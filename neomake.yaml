@@ -36,7 +36,7 @@ nodes:
       - script: |
           cargo test --no-fail-fast
 
-  hook:pre-push:
+  "hook:pre-push":
     pre:
       - regex: "^build:"
       - name: test

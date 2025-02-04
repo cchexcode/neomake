@@ -206,11 +206,12 @@ pub(crate) enum Command {
         format: Format,
     },
     Watch {
-        workflow: String,
-        watch: String,
-        args: HashMap<String, String>,
-        workers: usize,
+        filter: String,
         root: String,
+        program: Vec<String>,
+        stderr: usize,
+        commands: Vec<String>,
+        parallelism: Option<usize>,
     },
     Multiplex {
         program: Vec<String>,
@@ -268,31 +269,6 @@ impl ClapArgumentLoader {
                             .long("shell")
                             .value_parser(["bash", "zsh", "fish", "elvish", "powershell"])
                             .required(true),
-                    ),
-            )
-            .subcommand(
-                clap::Command::new("watch")
-                    .about("Execute watch.")
-                    .arg(
-                        Arg::new("workflow")
-                            .long("workflow")
-                            .help("The workflow file to use.")
-                            .default_value("./neomake.yaml"),
-                    )
-                    .arg(clap::Arg::new("watch").short('w').long("watch").required(true))
-                    .arg(clap::Arg::new("root").short('r').long("root").default_value("./"))
-                    .arg(
-                        Arg::new("arg")
-                            .short('a')
-                            .long("arg")
-                            .action(ArgAction::Append)
-                            .help("Specifies a value for handlebars placeholders."),
-                    )
-                    .arg(
-                        Arg::new("workers")
-                            .long("workers")
-                            .help("Defines how many worker threads are created in the OS thread pool.")
-                            .default_value("1"),
                     ),
             )
             .subcommand(
@@ -486,6 +462,30 @@ impl ClapArgumentLoader {
                             .action(ArgAction::Append),
                     ]),
             )
+            .subcommand(
+                clap::Command::new("watch").about("Execute watch.").args([
+                    Arg::new("filter").short('f').long("filter").required(true),
+                    Arg::new("root").short('r').long("root").default_value("./"),
+                    Arg::new("program")
+                        .long("program")
+                        .help("Defines the program used to execute the commands given.")
+                        .default_value("/bin/sh -c"),
+                    Arg::new("parallelism")
+                        .short('p')
+                        .long("parallelism")
+                        .help("Defines how many worker threads are created in the OS thread pool.")
+                        .default_value("1"),
+                    Arg::new("stderr")
+                        .long("stderr")
+                        .help("Defines the length of stderr to display.")
+                        .default_value("8"),
+                    Arg::new("command")
+                        .short('c')
+                        .long("command")
+                        .help("A command to be executed.")
+                        .action(ArgAction::Append),
+                ]),
+            )
     }
 
     pub(crate) fn load() -> Result<CallArgs> {
@@ -583,20 +583,29 @@ impl ClapArgumentLoader {
                 format: Format::from_arg(x.get_one::<String>("output").unwrap().as_str())?,
             }
         } else if let Some(x) = command.subcommand_matches("watch") {
-            let mut args_map: HashMap<String, String> = HashMap::new();
-            if let Some(args) = x.get_many::<String>("arg") {
-                for v_arg in args {
-                    let spl: Vec<&str> = v_arg.splitn(2, "=").collect();
-                    args_map.insert(spl[0].to_owned(), spl[1].to_owned());
-                }
-            }
+            let commands = x
+                .get_many::<String>("command")
+                .unwrap_or_default()
+                .cloned()
+                .collect_vec();
 
+            let program = x
+                .get_one::<String>("program")
+                .unwrap()
+                .split_whitespace()
+                .into_iter()
+                .map(|v| v.to_owned())
+                .collect::<Vec<_>>();
             Command::Watch {
-                workflow: x.get_one::<String>("workflow").unwrap().clone(),
-                watch: x.get_one::<String>("watch").unwrap().to_owned(),
-                args: args_map,
-                workers: str::parse::<usize>(x.get_one::<String>("workers").unwrap()).unwrap(),
+                filter: x.get_one::<String>("filter").unwrap().to_owned(),
                 root: x.get_one::<String>("root").unwrap().to_owned(),
+                program,
+                stderr: x.get_one::<String>("stderr").unwrap().parse::<usize>()?,
+                commands,
+                parallelism: match x.get_one::<String>("parallelism") {
+                    | Some(v) => Some(v.parse::<usize>().unwrap()),
+                    | None => None,
+                },
             }
         } else if let Some(x) = command.subcommand_matches("multiplex") {
             let commands = x

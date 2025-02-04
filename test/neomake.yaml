@@ -153,11 +153,3 @@ nodes:
           printf "event kind: {{ EVENT_KIND }}\n"
           printf "event path: {{ EVENT_PATH }}\n"
           sleep 4;
-
-watch:
-  all:
-    filter: '^(modified\/data\/content)\|.+(\.yaml)$'
-    queue: true
-    exec:
-      node:
-        ref: hotel

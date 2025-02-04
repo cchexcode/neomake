@@ -23,6 +23,8 @@
   You can customize which shell or program (such as bash or python) `neomake` uses as interpreter for the command. You can also specify arguments that are provided per invocation via the command line, working directories and environment variables on multiple different levels. Generally, values defined in the inner scope will extend and replace the outer scope.
 - **Plan & execute**\
   Supporting execution of commands in two stages. First plan and render the entire execution. Then invoke the execution engine with the plan. This way, plans can be stored and reviewed before execution.
+- **Watch filesystem events**\
+  Watch filesystem events using a regular expression and invoke commands when these occurr. Useful for automatically re-building and other situations.
 
 ## Installation
 
@@ -148,10 +150,6 @@ Stages need to run sequentially due to their nodes dependency on nodes executed 
 - `removed/folder`
 - `removed/other`
 
-The `filter` field in the `watch` node of the configuration file allows you to specify a filter using a regular expression. This filter is concatenated using the pipe character `|`, composing the event kind (found above) and the relative file path to the root.
-
-Example filter: `^(modified\/data\/content)\|.+(\.rs)$`. This filter would pass for any content change in a file ending with `.rs`.
-
 Examples events:
 - `modified/data/content|src/main.rs`
 - `created/folder|src/db`
@@ -166,17 +164,3 @@ Why would someone build a task runner if there's many alternatives out there? A 
 * `pyinvoke` (`tasks.py`) - executing tasks from within python scripts
 
 I built this utility because all of the alternatives I have tried, including the ones listed above were lacking some features. I was basically looking for a subset of the functionality which the GitLab pipelines provide incl. features such as matrix builds and more. Especially things like invoking commands in many locations, parallelizing tasks, easy parameterization and a few more.
-
-## Example configuration
-
-```yaml
-<-- ../res/templates/maxneomake.yaml -->
-```
-
-For more examples, call `neomake workflow init --help` or look at the schema with `neomake workflow schema`.
-
-## Schema
-
-```json
-<-- ./schema.json -->
-```

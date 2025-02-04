@@ -1,12 +1,12 @@
 [package]
 name = "neomake"
 version = "0.0.0"
-authors = ["Alexander Weber <aw@voidpointergroup.com>"]
+authors = ["cchexcode <alexanderh.weber@outlook.com>"]
 edition = "2021"
 license = "MIT"
-description = "Yet another task runner."
-homepage = "https://neomake.sh"
-repository = "https://github.com/replicadse/neomake"
+description = "A more powerful alternative to Makefiles."
+homepage = "https://github.com/cchexcode/neomake"
+repository = "https://github.com/cchexcode/neomake"
 keywords = ["make", "cli", "task", "runner"]
 categories = ["command-line-utilities"]
 readme = "docs/README.md"
