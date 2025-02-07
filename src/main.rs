@@ -271,3 +271,26 @@ async fn main() -> Result<()> {
         },
     }
 }
+
+#[cfg(test)]
+pub mod test {
+    use {
+        crate::Workflow,
+        anyhow::Result,
+    };
+
+    const WF_MIN_YAML: &str = include_str!("../res/templates/min.neomake.yaml");
+    const WF_MAX_YAML: &str = include_str!("../res/templates/max.neomake.yaml");
+    const WF_PYTHON_YAML: &str = include_str!("../res/templates/python.neomake.yaml");
+    const WF_TEST_YAML: &str = include_str!("../test/neomake.yaml");
+    const WF_MY_YAML: &str = include_str!("../neomake.yaml");
+    const ALL_WF_YAMLS: &[&str] = &[WF_MIN_YAML, WF_MAX_YAML, WF_PYTHON_YAML, WF_TEST_YAML, WF_MY_YAML];
+
+    #[tokio::test]
+    pub async fn test_parse_workflow() -> Result<()> {
+        for wf in ALL_WF_YAMLS {
+            let _ = serde_yaml::from_str::<Workflow>(wf)?;
+        }
+        Ok(())
+    }
+}
