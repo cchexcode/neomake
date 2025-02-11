@@ -123,24 +123,24 @@ impl Format {
 }
 
 #[derive(Debug)]
-pub(crate) enum InitTemplate {
+pub(crate) enum WorkflowInitTemplate {
     Min,
     Max,
     Python,
 }
 
-impl InitTemplate {
+impl WorkflowInitTemplate {
     pub(crate) fn render(&self) -> String {
         match self {
-            | InitTemplate::Min => include_str!("../res/templates/min.neomake.yaml").to_owned(),
-            | InitTemplate::Max => include_str!("../res/templates/max.neomake.yaml").to_owned(),
-            | InitTemplate::Python => include_str!("../res/templates/python.neomake.yaml").to_owned(),
+            | WorkflowInitTemplate::Min => include_str!("../res/templates/min.neomake.yaml").to_owned(),
+            | WorkflowInitTemplate::Max => include_str!("../res/templates/max.neomake.yaml").to_owned(),
+            | WorkflowInitTemplate::Python => include_str!("../res/templates/python.neomake.yaml").to_owned(),
         }
     }
 }
 
 #[derive(Debug)]
-pub(crate) enum InitOutput {
+pub(crate) enum WorkflowInitOutput {
     Stdout,
     File(String),
 }
@@ -170,6 +170,15 @@ impl Nodes {
 }
 
 #[derive(Debug)]
+pub(crate) enum WorkflowCommand {
+    Schema,
+    Init {
+        template: WorkflowInitTemplate,
+        output: WorkflowInitOutput,
+    },
+}
+
+#[derive(Debug)]
 pub(crate) enum Command {
     Manual {
         path: String,
@@ -179,11 +188,7 @@ pub(crate) enum Command {
         path: String,
         shell: clap_complete::Shell,
     },
-    WorkflowInit {
-        template: InitTemplate,
-        output: InitOutput,
-    },
-    WorkflowSchema,
+    Workflow(WorkflowCommand),
     Execute {
         plan: ExecutionPlan,
         workers: usize,
@@ -520,20 +525,20 @@ impl ClapArgumentLoader {
             }
         } else if let Some(x) = command.subcommand_matches("workflow") {
             if let Some(x) = x.subcommand_matches("init") {
-                Command::WorkflowInit {
+                Command::Workflow(WorkflowCommand::Init {
                     template: match x.get_one::<String>("template").unwrap().as_str() {
-                        | "min" => InitTemplate::Min,
-                        | "max" => InitTemplate::Max,
-                        | "python" => InitTemplate::Python,
+                        | "min" => WorkflowInitTemplate::Min,
+                        | "max" => WorkflowInitTemplate::Max,
+                        | "python" => WorkflowInitTemplate::Python,
                         | _ => return Err(anyhow::anyhow!("argument \"template\": unknown template")),
                     },
                     output: match x.get_one::<String>("output").unwrap().as_str() {
-                        | "-" => InitOutput::Stdout,
-                        | s => InitOutput::File(s.to_owned()),
+                        | "-" => WorkflowInitOutput::Stdout,
+                        | s => WorkflowInitOutput::File(s.to_owned()),
                     },
-                }
+                })
             } else if let Some(_) = x.subcommand_matches("schema") {
-                Command::WorkflowSchema
+                Command::Workflow(WorkflowCommand::Schema)
             } else {
                 return Err(anyhow::anyhow!("unknown command"));
             }

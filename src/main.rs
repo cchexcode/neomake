@@ -28,8 +28,8 @@ use {
     },
     anyhow::Result,
     args::{
-        InitOutput,
         ManualFormat,
+        WorkflowInitOutput,
     },
     exec::{
         ExecutionEngine,
@@ -62,19 +62,23 @@ async fn main() -> Result<()> {
             reference::build_shell_completion(&out_path, &shell)?;
             Ok(())
         },
-        | crate::args::Command::WorkflowInit { template, output } => {
-            match output {
-                | InitOutput::File(f) => std::fs::write(f, template.render())?,
-                | InitOutput::Stdout => print!("{}", template.render()),
-            };
-            Ok(())
-        },
-        | crate::args::Command::WorkflowSchema => {
-            print!(
-                "{}",
-                serde_json::to_string_pretty(&schemars::schema_for!(crate::workflow::Workflow)).unwrap()
-            );
-            Ok(())
+        | crate::args::Command::Workflow(wf) => {
+            match wf {
+                | crate::args::WorkflowCommand::Schema => {
+                    print!(
+                        "{}",
+                        serde_json::to_string_pretty(&schemars::schema_for!(crate::workflow::Workflow)).unwrap()
+                    );
+                    Ok(())
+                },
+                | crate::args::WorkflowCommand::Init { template, output } => {
+                    match output {
+                        | WorkflowInitOutput::File(f) => std::fs::write(f, template.render())?,
+                        | WorkflowInitOutput::Stdout => print!("{}", template.render()),
+                    };
+                    Ok(())
+                },
+            }
         },
         | crate::args::Command::Execute {
             plan,
