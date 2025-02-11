@@ -1,6 +1,6 @@
 [package]
 name = "neomake"
-version = "0.6.0-alpha.1"
+version = "0.0.0"
 authors = ["cchexcode <alexanderh.weber@outlook.com>"]
 edition = "2021"
 license = "MIT"

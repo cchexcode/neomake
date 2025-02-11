@@ -151,10 +151,9 @@ nodes:
       - name: release:asset:verify
     tasks:
       - script: |
-          cargo publish --dry-run --allow-dirty
-
-  "release":
-    pre:
-      - name: release:github
-      - name: release:cratesio
-    tasks: []
+          cargo publish --dry-run
+          cp Cargo.toml Cargo.toml.bak
+          sed 's/version = "0.0.0"/version = "{{ version }}"/g' Cargo.toml > Cargo.toml.tmp
+          mv Cargo.toml.tmp Cargo.toml
+          cargo publish --allow-dirty
+          mv Cargo.toml.bak Cargo.toml
