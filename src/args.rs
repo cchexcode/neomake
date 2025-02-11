@@ -41,6 +41,12 @@ impl CallArgs {
         match &self.command {
             | Command::Multiplex { .. } => Err(anyhow::anyhow!("experimental command: multiplex"))?,
             | Command::Watch { .. } => Err(anyhow::anyhow!("experimental command: watch"))?,
+            | Command::List { format, .. } => {
+                match &format {
+                    | CommandListFormat::Custom => Err(anyhow::anyhow!("experimental format: custom"))?,
+                    | _ => {},
+                }
+            },
             | _ => (),
         }
 
@@ -65,6 +71,12 @@ pub(crate) enum Format {
     RON {
         pretty: bool,
     },
+}
+
+#[derive(Debug)]
+pub(crate) enum CommandListFormat {
+    Standard(Format),
+    Custom,
 }
 
 impl Format {
@@ -203,7 +215,7 @@ pub(crate) enum Command {
     },
     List {
         workflow: String,
-        format: Format,
+        format: CommandListFormat,
     },
     Describe {
         workflow: String,
@@ -432,7 +444,13 @@ impl ClapArgumentLoader {
                             .short('o')
                             .long("output")
                             .help("The output format.")
-                            .value_parser(output_formats.clone())
+                            .value_parser(
+                                output_formats
+                                    .clone()
+                                    .into_iter()
+                                    .chain(vec!["custom"])
+                                    .collect::<Vec<_>>(),
+                            )
                             .default_value(output_formats.first().unwrap()),
                     ),
             )
@@ -579,7 +597,10 @@ impl ClapArgumentLoader {
         } else if let Some(x) = command.subcommand_matches("list") {
             Command::List {
                 workflow: x.get_one::<String>("workflow").unwrap().clone(),
-                format: Format::from_arg(x.get_one::<String>("output").unwrap().as_str())?,
+                format: match x.get_one::<String>("output").unwrap().as_str() {
+                    | "custom" => CommandListFormat::Custom,
+                    | v => CommandListFormat::Standard(Format::from_arg(v)?),
+                },
             }
         } else if let Some(x) = command.subcommand_matches("describe") {
             Command::Describe {

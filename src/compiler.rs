@@ -1,5 +1,6 @@
 use {
     crate::{
+        args::CommandListFormat,
         plan,
         workflow::{
             NodeSelector,
@@ -98,7 +99,7 @@ impl Compiler {
         Ok(plan)
     }
 
-    pub async fn list(&self, format: &crate::args::Format) -> Result<()> {
+    pub async fn list(&self, format: &crate::args::CommandListFormat) -> Result<()> {
         #[derive(Debug, serde::Serialize)]
         struct Output {
             nodes: Vec<OutputNode>,
@@ -144,7 +145,23 @@ impl Compiler {
         };
         info.nodes.sort_by(|a, b| a.name.cmp(&b.name));
 
-        println!("{}", format.serialize(&info)?);
+        match format {
+            | CommandListFormat::Custom => {
+                for n in &info.nodes {
+                    println!("[{}]", n.name);
+                    if let Some(desc) = &n.description {
+                        println!("{}", desc);
+                    }
+                    if let Some(pre) = &n.pre {
+                        println!("prerequisites: [\"{}\"]", pre.join("\", \""))
+                    }
+                    println!("");
+                }
+            },
+            | CommandListFormat::Standard(format) => {
+                println!("{}", format.serialize(&info)?);
+            },
+        }
 
         Ok(())
     }
