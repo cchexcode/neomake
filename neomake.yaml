@@ -1,5 +1,10 @@
 version: "0.0"
 
+env:
+  vars:
+    # SHELLOPTS: "errexit:nounset:pipefail:xtrace"
+    SHELLOPTS: "errexit:nounset:pipefail"
+
 nodes:
   "build:docs":
     tasks:
@@ -7,6 +12,10 @@ nodes:
           cargo doc --no-deps --document-private-items
 
   "build:program":
+    env:
+      vars:
+        # unset features are allowed here
+        SHELLOPTS: "errexit:pipefail"
     matrix:
       parallel: false
       dimensions:
@@ -40,4 +49,112 @@ nodes:
     pre:
       - regex: "^build:"
       - name: test
+    tasks: []
+
+  "release:init":
+    pre:
+      - regex: "^build:"
+      - name: test
+    tasks:
+      - script: |
+          rm -rf ./.release || true
+          mkdir ./.release
+          mkdir ./.release/temp
+          mkdir ./.release/assets
+  "release:asset:generate:manpages":
+    pre:
+      - name: release:init
+    tasks:
+      - script: |
+          cargo run -- man -o ./.release/temp/manpages -f manpages
+          cd ./.release/temp/manpages
+          tar -czf ../../assets/docs-manpages.tar.gz .
+  "release:asset:generate:markdown":
+    pre:
+      - name: release:init
+    tasks:
+      - script: |
+          cargo run -- man -o ./.release/temp/markdown -f markdown
+          cd ./.release/temp/markdown
+          tar -czf ../../assets/docs-markdown.tar.gz .
+  "release:asset:generate:shellcompletion":
+    pre:
+      - name: release:init
+    matrix:
+      parallel: true
+      dimensions:
+        - - env:
+              vars:
+                LANGUAGE: bash
+          - env:
+              vars:
+                LANGUAGE: zsh
+          - env:
+              vars:
+                LANGUAGE: fish
+          - env:
+              vars:
+                LANGUAGE: elvish
+          - env:
+              vars:
+                LANGUAGE: powershell
+    tasks:
+      - script: |
+          mkdir -p "./.release/temp/shellcompletion"
+          cargo run -- autocomplete -o ./.release/temp/shellcompletion/${LANGUAGE} -s ${LANGUAGE}
+          cd ./.release/temp/shellcompletion/${LANGUAGE}
+          tar -czf ../../../assets/shell-completion-${LANGUAGE}.tar.gz .
+  "release:asset:sign":
+    pre:
+      - regex: "^release:asset:generate:"
+    tasks:
+      - script: |
+          for file in ./.release/assets/*; do
+            echo "Signing: ${file}"
+            gpg --default-key="{{ signer }}" --armor --detach-sig --output ./.release/assets/$(basename -- ${file}).sig ${file}
+            echo ""
+          done
+  "release:asset:verify":
+    pre:
+      - name: release:asset:sign
+    tasks:
+      - script: |
+          for sig in ./.release/assets/*.sig; do
+            echo "Verifying: ${sig%.sig} with signature ${sig}"
+            gpg --verify "$sig" "${sig%.sig}"
+            echo ""
+          done
+
+  "release:github":
+    pre:
+      - name: release:asset:verify
+    tasks:
+      - script: |
+          echo "=== === ==="
+          echo "Releasing neomake version: {{ version }}"
+          echo "--- --- ---"
+      - script: |
+          if ! [ -z "$(git status --porcelain)" ]; then
+            echo "Dirty repo. Please commit all changes before releasing."
+            exit 1
+          fi
+      - script: |
+          if ! gh auth status >/dev/null 2>&1; then
+              echo "You need to login: gh auth login"
+              exit 1
+          fi
+      - script: |
+          gh release create {{ version }} --latest --target=master --title="Release {{ version }}" ./.release/assets/*
+
+  "release:cratesio":
+    pre:
+      - name: release:asset:verify
+    tasks:
+      - script: |
+          cargo publish --dry-run --allow-dirty
+
+  "release":
+    pre:
+      - name: release:github
+      - name: release:cratesio
     tasks: []

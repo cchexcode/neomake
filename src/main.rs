@@ -1,14 +1,8 @@
 use {
     bobr::multiplexer::Multiplexer,
-    notify::{
-        RecommendedWatcher,
-        Watcher,
-    },
+    notify::{RecommendedWatcher, Watcher},
     signal_hook::{
-        consts::{
-            SIGINT,
-            SIGTERM,
-        },
+        consts::{SIGINT, SIGTERM},
         iterator::Signals,
     },
     std::path::Path,
@@ -22,19 +16,10 @@ pub mod reference;
 pub mod workflow;
 
 use {
-    crate::{
-        compiler::Compiler,
-        workflow::Workflow,
-    },
+    crate::{compiler::Compiler, workflow::Workflow},
     anyhow::Result,
-    args::{
-        ManualFormat,
-        WorkflowInitOutput,
-    },
-    exec::{
-        ExecutionEngine,
-        OutputMode,
-    },
+    args::{ManualFormat, WorkflowInitOutput},
+    exec::{ExecutionEngine, OutputMode},
     std::path::PathBuf,
 };
 
@@ -62,23 +47,21 @@ async fn main() -> Result<()> {
             reference::build_shell_completion(&out_path, &shell)?;
             Ok(())
         },
-        | crate::args::Command::Workflow(wf) => {
-            match wf {
-                | crate::args::WorkflowCommand::Schema => {
-                    print!(
-                        "{}",
-                        serde_json::to_string_pretty(&schemars::schema_for!(crate::workflow::Workflow)).unwrap()
-                    );
-                    Ok(())
-                },
-                | crate::args::WorkflowCommand::Init { template, output } => {
-                    match output {
-                        | WorkflowInitOutput::File(f) => std::fs::write(f, template.render())?,
-                        | WorkflowInitOutput::Stdout => print!("{}", template.render()),
-                    };
-                    Ok(())
-                },
-            }
+        | crate::args::Command::Workflow(wf) => match wf {
+            | crate::args::WorkflowCommand::Schema => {
+                print!(
+                    "{}",
+                    serde_json::to_string_pretty(&schemars::schema_for!(crate::workflow::Workflow)).unwrap()
+                );
+                Ok(())
+            },
+            | crate::args::WorkflowCommand::Init { template, output } => {
+                match output {
+                    | WorkflowInitOutput::File(f) => std::fs::write(f, template.render())?,
+                    | WorkflowInitOutput::Stdout => print!("{}", template.render()),
+                };
+                Ok(())
+            },
         },
         | crate::args::Command::Execute {
             plan,
@@ -164,107 +147,79 @@ async fn main() -> Result<()> {
             });
 
             let mut watcher = RecommendedWatcher::new(
-                move |result: Result<notify::Event, notify::Error>| {
-                    match result {
-                        | Ok(e) => {
-                            let event_kind = match &e.kind {
-                                | notify::EventKind::Create(v) => {
-                                    match &v {
-                                        | notify::event::CreateKind::Any => "created/any",
-                                        | notify::event::CreateKind::File => "created/file",
-                                        | notify::event::CreateKind::Folder => "created/folder",
-                                        | notify::event::CreateKind::Other => "created/other",
-                                    }
+                move |result: Result<notify::Event, notify::Error>| match result {
+                    | Ok(e) => {
+                        let event_kind = match &e.kind {
+                            | notify::EventKind::Create(v) => match &v {
+                                | notify::event::CreateKind::Any => "created/any",
+                                | notify::event::CreateKind::File => "created/file",
+                                | notify::event::CreateKind::Folder => "created/folder",
+                                | notify::event::CreateKind::Other => "created/other",
+                            },
+                            | notify::EventKind::Modify(v) => match &v {
+                                | notify::event::ModifyKind::Any => "modified/any",
+                                | notify::event::ModifyKind::Data(v) => match &v {
+                                    | notify::event::DataChange::Any => "modified/data/any",
+                                    | notify::event::DataChange::Size => "modified/data/size",
+                                    | notify::event::DataChange::Content => "modified/data/content",
+                                    | notify::event::DataChange::Other => "modified/data/other",
                                 },
-                                | notify::EventKind::Modify(v) => {
-                                    match &v {
-                                        | notify::event::ModifyKind::Any => "modified/any",
-                                        | notify::event::ModifyKind::Data(v) => {
-                                            match &v {
-                                                | notify::event::DataChange::Any => "modified/data/any",
-                                                | notify::event::DataChange::Size => "modified/data/size",
-                                                | notify::event::DataChange::Content => "modified/data/content",
-                                                | notify::event::DataChange::Other => "modified/data/other",
-                                            }
-                                        },
-                                        | notify::event::ModifyKind::Metadata(v) => {
-                                            match &v {
-                                                | notify::event::MetadataKind::Any => "modified/metadata/any",
-                                                | notify::event::MetadataKind::AccessTime => {
-                                                    "modified/metadata/accesstime"
-                                                },
-                                                | notify::event::MetadataKind::WriteTime => {
-                                                    "modified/metadata/writetime"
-                                                },
-                                                | notify::event::MetadataKind::Permissions => {
-                                                    "modified/metadata/permissions"
-                                                },
-                                                | notify::event::MetadataKind::Ownership => {
-                                                    "modified/metadata/ownership"
-                                                },
-                                                | notify::event::MetadataKind::Extended => "modified/metadata/extended",
-                                                | notify::event::MetadataKind::Other => "modified/metadata/other",
-                                            }
-                                        },
-                                        | notify::event::ModifyKind::Name(v) => {
-                                            match &v {
-                                                | notify::event::RenameMode::Any => "modified/name/any",
-                                                | notify::event::RenameMode::To => "modified/name/to",
-                                                | notify::event::RenameMode::From => "modified/name/from",
-                                                | notify::event::RenameMode::Both => "modified/name/both",
-                                                | notify::event::RenameMode::Other => "modified/name/other",
-                                            }
-                                        },
-                                        | notify::event::ModifyKind::Other => "modified/other",
-                                    }
+                                | notify::event::ModifyKind::Metadata(v) => match &v {
+                                    | notify::event::MetadataKind::Any => "modified/metadata/any",
+                                    | notify::event::MetadataKind::AccessTime => "modified/metadata/accesstime",
+                                    | notify::event::MetadataKind::WriteTime => "modified/metadata/writetime",
+                                    | notify::event::MetadataKind::Permissions => "modified/metadata/permissions",
+                                    | notify::event::MetadataKind::Ownership => "modified/metadata/ownership",
+                                    | notify::event::MetadataKind::Extended => "modified/metadata/extended",
+                                    | notify::event::MetadataKind::Other => "modified/metadata/other",
                                 },
-                                | notify::EventKind::Remove(v) => {
-                                    match &v {
-                                        | notify::event::RemoveKind::Any => "removed/any",
-                                        | notify::event::RemoveKind::File => "removed/file",
-                                        | notify::event::RemoveKind::Folder => "removed/folder",
-                                        | notify::event::RemoveKind::Other => "removed/other",
-                                    }
+                                | notify::event::ModifyKind::Name(v) => match &v {
+                                    | notify::event::RenameMode::Any => "modified/name/any",
+                                    | notify::event::RenameMode::To => "modified/name/to",
+                                    | notify::event::RenameMode::From => "modified/name/from",
+                                    | notify::event::RenameMode::Both => "modified/name/both",
+                                    | notify::event::RenameMode::Other => "modified/name/other",
                                 },
-                                | notify::EventKind::Other => "other",
-                                | notify::EventKind::Any => "any",
-                                | notify::EventKind::Access(k) => {
-                                    match &k {
-                                        | notify::event::AccessKind::Any => "access/any",
-                                        | notify::event::AccessKind::Read => "access/read",
-                                        | notify::event::AccessKind::Open(v) => {
-                                            match &v {
-                                                | notify::event::AccessMode::Any => "access/open/any",
-                                                | notify::event::AccessMode::Execute => "access/open/execute",
-                                                | notify::event::AccessMode::Read => "access/open/read",
-                                                | notify::event::AccessMode::Write => "access/open/write",
-                                                | notify::event::AccessMode::Other => "access/open/other",
-                                            }
-                                        },
-                                        | notify::event::AccessKind::Close(v) => {
-                                            match &v {
-                                                | notify::event::AccessMode::Any => "access/close/any",
-                                                | notify::event::AccessMode::Execute => "access/close/execute",
-                                                | notify::event::AccessMode::Read => "access/close/read",
-                                                | notify::event::AccessMode::Write => "access/close/write",
-                                                | notify::event::AccessMode::Other => "access/close/other",
-                                            }
-                                        },
-                                        | notify::event::AccessKind::Other => "other",
-                                    }
+                                | notify::event::ModifyKind::Other => "modified/other",
+                            },
+                            | notify::EventKind::Remove(v) => match &v {
+                                | notify::event::RemoveKind::Any => "removed/any",
+                                | notify::event::RemoveKind::File => "removed/file",
+                                | notify::event::RemoveKind::Folder => "removed/folder",
+                                | notify::event::RemoveKind::Other => "removed/other",
+                            },
+                            | notify::EventKind::Other => "other",
+                            | notify::EventKind::Any => "any",
+                            | notify::EventKind::Access(k) => match &k {
+                                | notify::event::AccessKind::Any => "access/any",
+                                | notify::event::AccessKind::Read => "access/read",
+                                | notify::event::AccessKind::Open(v) => match &v {
+                                    | notify::event::AccessMode::Any => "access/open/any",
+                                    | notify::event::AccessMode::Execute => "access/open/execute",
+                                    | notify::event::AccessMode::Read => "access/open/read",
+                                    | notify::event::AccessMode::Write => "access/open/write",
+                                    | notify::event::AccessMode::Other => "access/open/other",
                                 },
-                            };
+                                | notify::event::AccessKind::Close(v) => match &v {
+                                    | notify::event::AccessMode::Any => "access/close/any",
+                                    | notify::event::AccessMode::Execute => "access/close/execute",
+                                    | notify::event::AccessMode::Read => "access/close/read",
+                                    | notify::event::AccessMode::Write => "access/close/write",
+                                    | notify::event::AccessMode::Other => "access/close/other",
+                                },
+                                | notify::event::AccessKind::Other => "other",
+                            },
+                        };
 
-                            let event_path = e.paths[0].to_str().unwrap().trim_start_matches(&trim_path);
-                            let filter = format!("{}|{}", &event_kind, &event_path);
-                            if regex.is_match(&filter).unwrap() {
-                                tx.send(filter).unwrap();
-                            }
-                        },
-                        | Err(e) => {
-                            println!("{:?}", e);
-                        },
-                    }
+                        let event_path = e.paths[0].to_str().unwrap().trim_start_matches(&trim_path);
+                        let filter = format!("{}|{}", &event_kind, &event_path);
+                        if regex.is_match(&filter).unwrap() {
+                            tx.send(filter).unwrap();
+                        }
+                    },
+                    | Err(e) => {
+                        println!("{:?}", e);
+                    },
                 },
                 notify::Config::default(),
             )?;
@@ -278,10 +233,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 pub mod test {
-    use {
-        crate::Workflow,
-        anyhow::Result,
-    };
+    use {crate::Workflow, anyhow::Result};
 
     const WF_MIN_YAML: &str = include_str!("../res/templates/min.neomake.yaml");
     const WF_MAX_YAML: &str = include_str!("../res/templates/max.neomake.yaml");

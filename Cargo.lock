@@ -175,9 +175,9 @@ dependencies = [
 
 [[package]]
 name = "bobr"
-version = "0.2.0"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a590bcb2164a80effc937412296a49413b23bf8a1fce616325bb825130169fa4"
+checksum = "206b62479398bac54801a1e5c5605271a21ea70e346bad32c907811a149a04db"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -806,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "neomake"
-version = "0.0.0"
+version = "0.6.0-alpha.1"
 dependencies = [
  "anyhow",
  "async-trait",
