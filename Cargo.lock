@@ -175,8 +175,9 @@ dependencies = [
 
 [[package]]
 name = "bobr"
-version = "0.0.0"
-source = "git+https://github.com/cchexcode/bobr?branch=master#64cacd04ae8615fb8f3b969d40bb2b7550b75085"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a590bcb2164a80effc937412296a49413b23bf8a1fce616325bb825130169fa4"
 dependencies = [
  "anyhow",
  "async-trait",
