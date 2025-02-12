@@ -63,7 +63,7 @@ nodes:
           mkdir ./.release/assets
   "release:asset:generate:manpages":
     pre:
-      - name: release:init
+      - name: "release:init"
     tasks:
       - script: |
           cargo run -- man -o ./.release/temp/manpages -f manpages
@@ -71,7 +71,7 @@ nodes:
           tar -czf ../../assets/docs-manpages.tar.gz .
   "release:asset:generate:markdown":
     pre:
-      - name: release:init
+      - name: "release:init"
     tasks:
       - script: |
           cargo run -- man -o ./.release/temp/markdown -f markdown
@@ -79,7 +79,7 @@ nodes:
           tar -czf ../../assets/docs-markdown.tar.gz .
   "release:asset:generate:shellcompletion":
     pre:
-      - name: release:init
+      - name: "release:init"
     matrix:
       parallel: true
       dimensions:
@@ -116,7 +116,7 @@ nodes:
           done
   "release:asset:verify":
     pre:
-      - name: release:asset:sign
+      - name: "release:asset:sign"
     tasks:
       - script: |
           for sig in ./.release/assets/*.sig; do
@@ -127,7 +127,7 @@ nodes:
 
   "release:github":
     pre:
-      - name: release:asset:verify
+      - name: "release:asset:verify"
     tasks:
       - script: |
           echo "=== === ==="
@@ -145,10 +145,11 @@ nodes:
           fi
       - script: |
           gh release create {{ version }} --latest --target=master --title="Release {{ version }}" ./.release/assets/*
+          rm -rf .release
 
   "release:cratesio":
     pre:
-      - name: release:asset:verify
+      - regex: "^build:"
     tasks:
       - script: |
           cargo publish --dry-run
