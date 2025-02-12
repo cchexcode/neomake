@@ -1,16 +1,13 @@
 version: "0.0"
-
 env:
   vars:
     # SHELLOPTS: "errexit:nounset:pipefail:xtrace"
     SHELLOPTS: "errexit:nounset:pipefail"
-
 nodes:
   "build:docs":
     tasks:
       - script: |
           cargo doc --no-deps --document-private-items
-
   "build:program":
     env:
       vars:
@@ -39,22 +36,19 @@ nodes:
           export CARGO_FLAGS="$F_JSON $F_RON $RELEASE"
           echo cargo flags: \"$CARGO_FLAGS\"
           cargo build $CARGO_FLAGS
-
-  test:
+  "test:program":
     tasks:
       - script: |
           cargo test --no-fail-fast
-
   "hook:pre-push":
     pre:
       - regex: "^build:"
-      - name: test
+      - name: "test:program"
     tasks: []
-
   "release:init":
     pre:
       - regex: "^build:"
-      - name: test
+      - name: "test:program"
     tasks:
       - script: |
           rm -rf ./.release || true
@@ -124,7 +118,6 @@ nodes:
             gpg --verify "$sig" "${sig%.sig}"
             echo ""
           done
-
   "release:github":
     pre:
       - name: "release:asset:verify"
@@ -146,7 +139,6 @@ nodes:
       - script: |
           gh release create {{ version }} --latest --target=master --title="Release {{ version }}" ./.release/assets/*
           rm -rf .release
-
   "release:cratesio":
     pre:
       - regex: "^build:"
