@@ -60,6 +60,30 @@ nodes:
           mkdir ./.release
           mkdir ./.release/temp
           mkdir ./.release/assets
+  "release:asset:generate:compile":
+    description: "Compiles the application."
+    pre:
+      - name: "release:init"
+    matrix:
+      parallel: true
+      dimensions:
+        - - env:
+              vars:
+                TARGET: x86_64-unknown-linux-gnu
+          - env:
+              vars:
+                TARGET: x86_64-unknown-linux-musl
+          - env:
+              vars:
+                TARGET: aarch64-unknown-linux-gnu
+          - env:
+              vars:
+                TARGET: aarch64-apple-darwin
+    tasks:
+      - script: |
+          rustup target add --toolchain stable ${TARGET}
+          cross build --release --target ${TARGET}
+          cp ./target/${TARGET}/release/neomake ./.release/assets/neomake-${TARGET}
   "release:asset:generate:manpages":
     description: "Generates manpages."
     pre:
@@ -149,7 +173,6 @@ nodes:
           fi
       - script: |
           gh release create {{ version }} --latest --target=master --title="Release {{ version }}" ./.release/assets/*
-          rm -rf .release
   "release:cratesio":
     description: "Releases to crates.io."
     pre:

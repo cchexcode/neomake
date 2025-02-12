@@ -167,9 +167,20 @@ I built this utility because all of the alternatives I have tried, including the
 
 ## Development
 
-Releasing:
+**Releasing:**
 
 - GitHub
   `neomake plan -n release:github -aversion="${VERSION}" -asigner="${SIGNER}" | neomake x`
 - crates.io
   `neomake plan -n release:cratesio -aversion="${VERSION}" -asigner="${SIGNER}" | neomake x`
+
+Required tools:
+
+- Rust dev tooling (`cargo`, `rustc`, `rustup`, ...)
+- `cross` - for cross compiling
+  `cargo install cross --git https://github.com/cross-rs/cross`
+- `github cli` - for creating github releases
+  `brew install gh`
+- `gpg` - for signing release assets
+  `brew install gpg`
+- `tar` - for creating tarballs
