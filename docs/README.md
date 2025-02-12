@@ -164,3 +164,12 @@ Why would someone build a task runner if there's many alternatives out there? A 
 * `pyinvoke` (`tasks.py`) - executing tasks from within python scripts
 
 I built this utility because all of the alternatives I have tried, including the ones listed above were lacking some features. I was basically looking for a subset of the functionality which the GitLab pipelines provide incl. features such as matrix builds and more. Especially things like invoking commands in many locations, parallelizing tasks, easy parameterization and a few more.
+
+## Development
+
+Releasing:
+
+- GitHub
+  `neomake plan -n release:github -aversion="${VERSION}" -asigner="${SIGNER}" | neomake x`
+- crates.io
+  `neomake plan -n release:cratesio -aversion="${VERSION}" -asigner="${SIGNER}" | neomake x`
