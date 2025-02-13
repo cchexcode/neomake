@@ -38,6 +38,11 @@ nodes:
           export CARGO_FLAGS="$F_JSON $F_RON $RELEASE"
           echo cargo flags: \"$CARGO_FLAGS\"
           cargo build $CARGO_FLAGS
+  "dependencies:upgrade":
+    description: "Upgrades all dependencies."
+    tasks:
+      - script: |
+          cargo upgrade -i --pinned
   "test:program":
     description: "Tests the program."
     tasks:
