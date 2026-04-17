@@ -1,0 +1,44 @@
+[package]
+name = "neomake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../docs/README.md"
+
+[[bin]]
+name = "neomake"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+clap_mangen = { workspace = true }
+clap-markdown = { workspace = true }
+schemars = { workspace = true }
+handlebars = { workspace = true }
+itertools = { workspace = true }
+threadpool = { workspace = true }
+fancy-regex = { workspace = true }
+notify = { workspace = true }
+signal-hook = { workspace = true }
+flume = { workspace = true }
+parking_lot = { workspace = true }
+walkdir = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+futures = { workspace = true }
+jiff = { workspace = true }
+hocon = { workspace = true }
+
+[dev-dependencies]
+hoox = "0.3"

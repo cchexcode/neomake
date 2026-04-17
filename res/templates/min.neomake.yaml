@@ -1,9 +1,0 @@
-version: "0.6"
-
-nodes:
-  minimal:
-    tasks:
-      - script: |
-          set -e
-          printf "first line"
-          printf "second line"
