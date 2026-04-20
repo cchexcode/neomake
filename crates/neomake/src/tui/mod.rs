@@ -55,9 +55,10 @@ pub async fn run(rx: UnboundedReceiver<ExecEvent>, cancel: Cancel) -> Result<boo
     result
 }
 
-/// Force the crossterm event-reader singleton to initialize without entering raw mode or
-/// the alternate screen. Lets the caller detect `/dev/tty` / kqueue problems and fall back
-/// to the plain driver before we've touched the terminal state.
+/// Force the crossterm event-reader singleton to initialize without entering
+/// raw mode or the alternate screen. Lets the caller detect `/dev/tty` / kqueue
+/// problems and fall back to the plain driver before we've touched the terminal
+/// state.
 pub fn probe_event_reader() -> std::io::Result<()> {
     crossterm::event::poll(std::time::Duration::from_millis(0)).map(|_| ())
 }

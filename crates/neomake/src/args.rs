@@ -138,10 +138,15 @@ pub enum Command {
         no_stdout: bool,
         no_stderr: bool,
         tui: crate::runner::TuiMode,
+        summary: bool,
     },
     List {
         workflow: String,
         format: ListFormat,
+    },
+    Lint {
+        workflow: String,
+        json: bool,
     },
     Describe {
         workflow: String,
@@ -299,7 +304,10 @@ impl ClapArgumentLoader {
                             .long("no-tui")
                             .num_args(0)
                             .help("Disable the TUI. Default: TUI when stderr is a TTY, plain otherwise."),
-                    ),
+                    )
+                    .arg(Arg::new("summary").long("summary").num_args(0).help(
+                        "After the run, print a timing summary (wave durations, slowest batches, critical path).",
+                    )),
             )
             .subcommand(
                 clap::Command::new("describe")
@@ -334,6 +342,19 @@ impl ClapArgumentLoader {
                             .long("output")
                             .value_parser(["json", "json+p", "custom"])
                             .default_value("json"),
+                    ),
+            )
+            .subcommand(
+                clap::Command::new("lint")
+                    .about("Validate a workflow — reports unresolved selectors, cycles, bad regex, and empty matrices.")
+                    .arg(Arg::new("workflow").long("workflow").default_value("./neomake.conf"))
+                    .arg(
+                        Arg::new("output")
+                            .short('o')
+                            .long("output")
+                            .help("Output format. 'text' is human-readable; 'json' is machine-parseable.")
+                            .value_parser(["text", "json"])
+                            .default_value("text"),
                     ),
             )
             .subcommand(
@@ -468,6 +489,7 @@ impl ClapArgumentLoader {
                 } else {
                     crate::runner::TuiMode::Auto
                 },
+                summary: x.get_flag("summary"),
             }
         } else if let Some(x) = m.subcommand_matches("describe") {
             Command::Describe {
@@ -484,6 +506,11 @@ impl ClapArgumentLoader {
                     | "custom" => ListFormat::Custom,
                     | _ => return Err(anyhow!("unknown list format")),
                 },
+            }
+        } else if let Some(x) = m.subcommand_matches("lint") {
+            Command::Lint {
+                workflow: x.get_one::<String>("workflow").unwrap().clone(),
+                json: x.get_one::<String>("output").map(|s| s == "json").unwrap_or(false),
             }
         } else if let Some(x) = m.subcommand_matches("multiplex") {
             let commands = x

@@ -76,17 +76,63 @@ async fn main() -> Result<()> {
             no_stdout,
             no_stderr,
             tui,
+            summary,
         } => {
-            runner::execute(plan, workers, tui, runner::PlainOutput {
-                stdout: !no_stdout,
-                stderr: !no_stderr,
-            })
+            runner::execute(
+                plan,
+                workers,
+                tui,
+                runner::PlainOutput {
+                    stdout: !no_stdout,
+                    stderr: !no_stderr,
+                },
+                summary,
+            )
             .await?;
         },
         | Command::List { workflow, format } => {
             let w = Workflow::load(&workflow)?;
             let c = Compiler::new(w);
             c.list(&format).await?;
+        },
+        | Command::Lint { workflow, json } => {
+            let w = Workflow::load(&workflow)?;
+            let c = Compiler::new(w);
+            let findings = c.lint()?;
+            let exit_code = if findings.iter().any(|f| matches!(f.level, plan::LintLevel::Error)) {
+                1
+            } else {
+                0
+            };
+            if json {
+                let out: Vec<_> = findings
+                    .iter()
+                    .map(|f| {
+                        serde_json::json!({
+                            "level": match f.level {
+                                plan::LintLevel::Error => "error",
+                                plan::LintLevel::Warn => "warn",
+                            },
+                            "node": f.node,
+                            "message": f.message,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else if findings.is_empty() {
+                println!("ok — no findings");
+            } else {
+                for f in &findings {
+                    let tag = match f.level {
+                        | plan::LintLevel::Error => "error",
+                        | plan::LintLevel::Warn => "warn",
+                    };
+                    println!("{:<5} [{}] {}", tag, f.node, f.message);
+                }
+            }
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
         },
         | Command::Describe {
             workflow,

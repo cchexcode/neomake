@@ -36,8 +36,23 @@ Released and actively maintained.
 - **Handlebars templating.** Task scripts may reference `{{ args.foo }}`; pass values on the
   command line with `-a foo=value` (dot-notation produces nested objects). Strict mode: a
   missing key is a hard error.
-- **HOCON-only workflow format.** No YAML. HOCON's comments, substitutions, includes, and
-  object-merge semantics are a clean fit for configuration.
+- **HOCON-only workflow format.** No YAML. HOCON's comments, substitutions, `include`
+  directives, and object-merge semantics are a clean fit for configuration. Split large
+  workflows with `include "shared.conf"`; paths resolve relative to the workflow file.
+- **Conditional nodes (`when`).** Guard a node with a handlebars template or a shell
+  script — falsy guards drop the node from the plan entirely at compile time.
+- **Retries.** `retry { attempts, backoff, delay_ms }` on a node or a single task,
+  re-runs the same command with fixed / linear / exponential backoff.
+- **Inputs streaming.** Declare `inputs = [ { name = "producer" } ]` and the consumer
+  gets the producer's captured stdout piped to its stdin as a single JSON blob —
+  matrix cells and all. Lets you chain nodes without temp files.
+- **Static analysis (`lint`).** Validates a workflow: unresolved selectors, bad regex,
+  empty matrices, cycles — exits non-zero on any real error.
+- **Container encapsulation.** Declare `container { image = "alpine" }` at workflow,
+  node, matrix-cell, or task scope (innermost-wins merge) to route those tasks through
+  `docker run` / `podman run` with the host CWD bind-mounted. Pick the runtime
+  explicitly with `runtime = "docker"` or `"podman"` (default `docker`, no autoselect).
+  No CLI flags — everything lives in the workflow file.
 - **Native command multiplexing.** `neomake multiplex` runs N shell commands concurrently
   with a bounded parallelism budget. When run from a terminal it shows a ratatui-based TUI
   — task tree with live status, log pane per task, follow mode, help overlay — mirroring
@@ -152,6 +167,7 @@ Node names must match `^[a-zA-Z0-9:_-]+$`. `pre` entries are either
 | `plan --workflow F (-n NAME \| -r RE)`  | `p`              | Compile workflow → execution-plan JSON on stdout.                   |
 | `execute [-f PATH] [-w N] [--no-stdout] [--no-stderr] [--no-tui]` | `exec`, `x` | Run a plan. Reads stdin or `--file`. TUI when stdin AND stderr are TTYs. |
 | `list --workflow F [-o json\|json+p\|custom]` | `ls`, `l`  | List all nodes.                                                     |
+| `lint --workflow F [-o text\|json]`     |                  | Validate the workflow (exits 1 on errors).                          |
 | `describe --workflow F (-n NAME \| -r RE) [--pretty]` | `desc`, `d` | Print DAG waves as JSON.                                |
 | `multiplex -c CMD… [-p N] [--stdout] [--no-tui]` | `m`, `mp` | Concurrent shell-command runner (experimental). TUI by default.     |
 | `watch -f REGEX -r DIR -c CMD…`         |                  | Re-run commands on matching filesystem events (experimental).       |
@@ -162,6 +178,96 @@ Experimental commands require `-e/--experimental`:
 
 ```bash
 neomake -e multiplex -c 'cargo test' -c 'cargo clippy' -p2 --stdout --pretty
+```
+
+## Conditional nodes, retries, and input streaming
+
+```hocon
+version = "0.0"
+
+include "shared.conf"          # splits are OK; paths are relative to this file
+
+nodes {
+  fetch {
+    tasks = [ { script = "curl -s https://example.com/data.json" } ]
+  }
+
+  transform {
+    inputs = [ { name = "fetch" } ]            # implies pre; pipes fetch's stdout on stdin
+    tasks = [
+      { script = "jq -r '.items[] | @json'" }
+    ]
+  }
+
+  publish {
+    when  = "{{ args.env }}"                   # skipped unless -a args.env=prod
+    pre   = [ { name = "transform" } ]
+    retry { attempts = 3, backoff = "exponential", delay_ms = 500 }
+    tasks = [ { script = "upload-to-s3 ..." } ]
+  }
+}
+```
+
+The consumer (`transform`) receives on stdin a JSON object keyed by producer → cell:
+
+```json
+{
+  "fetch": {
+    "": "…the raw curl output…"
+  }
+}
+```
+
+For a matrix producer, each cell is its own key (comma-joined coordinates). Single-
+invocation producers use the empty string — structurally guaranteed unique, so there's
+one entry per cell no matter the shape:
+
+```json
+{
+  "build_matrix": {
+    "0,0": "…build for debug/amd64…",
+    "0,1": "…build for debug/arm64…",
+    "1,0": "…build for release/amd64…",
+    "1,1": "…build for release/arm64…"
+  }
+}
+```
+
+```sh
+jq -r '.fetch[""]'                          # simple producer
+jq -r '.build_matrix["1,0"]'                # specific matrix cell
+jq -r '.build_matrix | to_entries[] | "\(.key): \(.value[0:40])"'   # iterate
+```
+
+### Lint and summary
+
+Catch misconfigurations before running anything:
+
+```bash
+$ neomake lint
+error [a] pre[0] references missing node "missing"
+warn  [b] inputs[0] regex "^no-match$" matches no nodes
+```
+
+After execution, get a post-run breakdown:
+
+```bash
+$ neomake plan -n publish | neomake execute --no-tui --summary
+…
+── summary ────────────────────────────────
+total: 412 ms · 3/3 batches ok
+  wave 0: 120 ms (1 batches)
+  wave 1:  64 ms (1 batches)
+  wave 2: 226 ms (1 batches)
+slowest batches:
+  ✓ publish — 226 ms (wave 2)
+  ✓ fetch   — 120 ms (wave 0)
+  ✓ transform —  64 ms (wave 1)
+critical path (410 ms):
+  → fetch (120 ms)
+  → transform (64 ms)
+  → publish (226 ms)
+───────────────────────────────────────────
 ```
 
 ## DAG execution
@@ -245,6 +351,89 @@ directly instead of going through stdin or mio/kqueue (the latter refuses termin
 on macOS). If `/dev/tty` is unreachable — some headless containers, for example —
 `neomake execute` prints a one-line notice to stderr and falls back to the plain driver
 without losing any output. `--no-tui` forces plain unconditionally.
+
+## Container encapsulation
+
+Any task can be routed through a container runtime (`docker` or `podman`) by declaring a
+`container { }` block in the workflow. It works at four scopes — **workflow**, **node**,
+**matrix cell**, **task** — merged innermost-wins with the same precedence chain as
+`env`. No CLI flags: every knob lives in the workflow, so plans stay self-describing and
+CI scripts don't grow a new set of toggles.
+
+```hocon
+version = "0.0"
+
+container {
+  image   = "alpine:latest"                # default for every task in this file
+  workdir = "/work"                        # bind-mount target + container cwd
+  user    = "host"                         # host (default) | root | "UID:GID"
+  mount   = true                           # bind host CWD at workdir (default true)
+  runtime {                                # pick exactly one variant with its extras
+    docker { extra_args = [ "--network=host" ] }
+  }
+}
+
+nodes {
+  host_only {
+    container { disabled = true }          # opt back out
+    tasks = [ { script = "uname -s" } ]
+  }
+
+  build {
+    tasks = [ { script = "cargo build --release" } ]    # uses alpine default
+  }
+
+  cross_build {
+    matrix {
+      parallel = true
+      dimensions = [[
+        { env { vars { T = "linux"  } } },                         # alpine (default)
+        { env { vars { T = "debian" } },
+          container { image = "debian:bookworm-slim" } }           # override this cell
+      ]]
+    }
+    tasks = [ { script = "cat /etc/os-release | head -1 && echo $T" } ]
+  }
+}
+```
+
+Running this: `alpine:latest` for `build`, host for `host_only`, and a mix of alpine +
+debian for `cross_build`'s two matrix cells.
+
+### Runtime selection
+
+`runtime` is a nested enum: `runtime { docker { … } }` or `runtime { podman { … } }`,
+each carrying the runtime's own `extra_args`. When no scope declares it, the default is
+docker with no extras. There's no auto-detection — asking for a runtime that isn't on
+PATH fails the task cleanly. `extra_args` accumulates across merge levels only while
+consecutive levels keep the same variant; switching (docker → podman or vice versa)
+resets.
+
+```hocon
+container {
+  image = "rust:1.94"
+  # Pick exactly one runtime variant; its extras are carried inline.
+  runtime {
+    docker { extra_args = [ "--network=host" ] }
+  }
+}
+```
+
+### Host-side semantics
+
+- Host CWD is bind-mounted at `workdir` (default `/work`). `mount = false` disables.
+- `user = "host"` maps container UID/GID to the host user — file writes into the mount
+  keep correct ownership. Use `"root"` for builds that need root, or `"UID:GID"` literal.
+- Task-declared `workdir` is **container-relative** (it's passed as `-w` to the runtime).
+- Input streaming works through `docker run -i`: consumers declared via `inputs` receive
+  their producers' JSON blob on stdin just like the host path.
+- `lint` flags `container` blocks with fields set but no `image` resolved, and warns when
+  the selected runtime's `extra_args` include flags neomake already sets (`-i`, `--rm`,
+  `-w`, `-v`, `-t`).
+
+### `multiplex`
+
+The `multiplex` subcommand is a host-only runner; containers are a workflow feature.
 
 ## Native multiplexer
 

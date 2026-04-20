@@ -33,7 +33,10 @@ crates/neomake/src/
                   line-by-line and emitted as `ExecEvent`s on an mpsc channel. Matrix
                   `parallel=true` spawns one batch per invocation; `parallel=false` glues
                   invocations into a single sequential batch. Supports cooperative cancel
-                  via `Cancel` (tripped on user `q` / Ctrl+C).
+                  via `Cancel` (tripped on user `q` / Ctrl+C). Each `Work` carries an
+                  optional `ResolvedContainer`; when present, `run_one` branches through
+                  `build_container_command` to spawn `<docker|podman> run --rm -i …` using
+                  a shared `RuntimeResolver` (cached on the engine).
   runner.rs       Execution driver selection. `execute()` starts the engine task, then picks
                   between the TUI driver (`tui/`) and the plain streaming driver based on
                   TTY detection and the `--no-tui` flag. Plain driver forwards captured
@@ -103,6 +106,100 @@ crates/neomake/res/templates/
     are either exact names (`{ name = "x" }`) or regex (`{ regex = "^build:.*$" }`), deserialized
     as a `#[serde(untagged)]` enum so HOCON `{ name = "a" }` maps cleanly.
 
+## Workflow Feature Reference
+
+### Guards (`when`)
+Per-node, evaluated at plan time. Two shapes:
+- `when = "{{ args.env }}"` — handlebars template; truthy (non-empty, not `false`/`0`/`no`) → include.
+  Renders with non-strict handlebars, so missing args are simply falsy.
+- `when { script = "[ -n \"$CI\" ]", shell = "/bin/sh -c" }` — runs a shell command; exit 0 → include.
+
+A node with a falsy guard is omitted from the plan entirely. If a node declared in `inputs`
+is guarded out, the compiler errors — depending on a node that won't run is a bug.
+
+### Retries
+`retry { attempts, backoff = fixed|linear|exponential, delay_ms }` on either a node or a
+task. Task-level overrides node-level. Retries happen at the **work** level (one task × one
+invocation), not the whole batch — on failure the same command retries up to `attempts - 1`
+more times with the chosen backoff. `Fixed` uses `delay_ms` flat; `Linear` scales by the
+attempt number; `Exponential` doubles each attempt (capped at 2^16).
+
+### Input streaming (`inputs`)
+List of `NodeSelector`s (same shape as `pre`). Declaring `inputs` implies `pre` — the
+producers always run first. When the consumer spawns, its stdin receives a single JSON
+blob then EOF:
+
+```json
+{
+  "producer_matrix": { "0,0": "...", "0,1": "...", "1,0": "...", "1,1": "..." },
+  "producer_simple": { "": "..." }
+}
+```
+
+Each producer is an object keyed by **cell coordinates** (comma-joined matrix indices;
+empty string for non-matrix producers). Using a dict rather than an array structurally
+guarantees one entry per cell. Each invocation of a matrix *consumer* gets the same full
+blob (no automatic cell matching). Aggregation of per-task outputs for a single invocation
+uses concatenation in task-declaration order.
+
+### Container encapsulation (`container`)
+
+Optional `container { }` block at four workflow scopes — `workflow`, `node`, `matrix_cell`,
+`task` — merged innermost-wins, same precedence chain as `env`. A task runs inside a
+container iff the merged result has `image` set and `disabled != true`. The plan baked by
+the compiler carries a fully-resolved `Option<ResolvedContainer>` per work item — no CLI
+flags control this; every knob lives in the workflow.
+
+```hocon
+container {
+  image   = "rust:1.94"
+  workdir = "/work"                        # container workdir + bind-mount target
+  user    = "host"                         # host | root | "UID:GID"
+  mount   = true                           # bind host CWD at workdir
+  # Runtime = nested enum carrying its own extras. Declare exactly one variant.
+  runtime {
+    docker { extra_args = [ "--network=host" ] }
+  }
+}
+```
+
+**Runtime is explicit** — exactly two variants (`docker`, `podman`), each carrying its
+own `extra_args`. Default when no merge level declares `runtime` is `docker { docker: {
+extra_args = [] } }`. There is no runtime auto-detection; asking for `podman` on a
+docker-only host fails cleanly at that task's spawn (wave failure → abort).
+`RuntimeResolver` caches per-runtime PATH availability so each runtime is probed at most
+once per engine run, no matter how many tasks use it.
+
+**Runtime merge semantics**: `extra_args` accumulates across merge levels **only while
+consecutive levels declare the same variant**. Switching variants (e.g. workflow = docker,
+task = podman) discards the prior variant's extras — you can't "leak" docker-specific
+flags onto podman. Within a single variant, order is preserved (workflow → node → cell →
+task).
+
+**Runtime-specific extras** are co-located sub-blocks (`docker { extra_args }`,
+`podman { extra_args }`). Only the sub-block matching the resolved runtime is applied.
+`extra_args` is **additive** across merge levels, preserving order.
+
+**Task-level merge quirk**: a plan `Task::container` is only populated when the task
+itself declared a `container` block — otherwise it's left `None` so at execute time the
+engine falls through to `Invocation::container` (which already captured
+workflow+node+cell merges). This preserves the expected "cell-level override wins for a
+plain task, but task-level override beats the cell" semantics.
+
+**Spawn shape** (in `exec.rs::build_container_command`):
+```
+<runtime> run --rm -i [-v host_cwd:workdir] -w <workdir>
+  [--user U:G] [-e K=V ...] [docker|podman.extra_args...]
+  <image> <shell_program> <shell_args...> <command>
+```
+Env vars go via `-e` (not `.envs()`) and workdir via `-w` (not `.current_dir()`).
+
+### HOCON `include`
+Use `include "other.conf"` at any object scope. Paths resolve relative to the workflow
+file's directory. Substitutions (`${foo}`) work across includes. `Workflow::load` reads
+from disk so includes resolve; `Workflow::parse` (test-only) reads from a string and
+disables includes.
+
 ## HOCON Workflow Format
 
 ```hocon
@@ -153,8 +250,9 @@ nodes {
 | `workflow init -t min\|max\|python -o FILE` | — | Emit a starter HOCON workflow. `-o -` prints to stdout. |
 | `workflow schema` | — | Print the JSON schema of the Workflow type. |
 | `plan --workflow FILE (-n NAME \| -r REGEX) [-a k=v] [--pretty]` | `p` | Compile workflow → ExecutionPlan JSON on stdout. |
-| `execute [-f FILE] [-w N] [--no-stdout] [--no-stderr] [--no-tui]` | `exec`, `x` | Run a plan from stdin (default) or `-f FILE`. TUI when stdin AND stderr are TTYs. |
+| `execute [-f FILE] [-w N] [--no-stdout] [--no-stderr] [--no-tui] [--summary]` | `exec`, `x` | Run a plan from stdin (default) or `-f FILE`. TUI when stderr is a TTY. `--summary` prints per-wave timings + critical path after exit. |
 | `list --workflow FILE [-o json\|json+p\|custom]` | `ls`, `l` | List all nodes. `custom` is human-readable. |
+| `lint --workflow FILE [-o text\|json]` | — | Static analysis: unresolved selectors, cycles, bad regex, empty matrices. Exit 1 on any error-level finding. |
 | `describe --workflow FILE (-n NAME \| -r REGEX) [--pretty]` | `desc`, `d` | Print DAG waves as JSON. |
 | `multiplex -c CMD … [-p N] [--stdout] [--pretty] [--no-tui]` **exp** | `m`, `mp` | Concurrent shell runner; TUI by default when on a terminal. |
 | `watch -f REGEX -r DIR -c CMD …` **exp** | — | Re-run commands on filesystem events matching regex. |
