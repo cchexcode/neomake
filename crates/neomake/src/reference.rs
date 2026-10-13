@@ -1,6 +1,9 @@
 use {
     crate::args::ClapArgumentLoader,
-    anyhow::Result,
+    anyhow::{
+        Context,
+        Result,
+    },
     clap_complete::Shell,
     clap_mangen::Man,
     std::{
@@ -32,7 +35,7 @@ pub fn build_shell_completion(outdir: &Path, shell: &Shell) -> Result<()> {
 pub fn build_markdown(outdir: &Path) -> Result<()> {
     for (name, cmd) in collect_commands() {
         let path = outdir.join(format!("{}.md", name.trim_start_matches('-')));
-        let mut f = File::create(&path)?;
+        let mut f = File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
         f.write_all(clap_markdown::help_markdown_command(&cmd).as_bytes())?;
     }
     Ok(())
@@ -41,7 +44,7 @@ pub fn build_markdown(outdir: &Path) -> Result<()> {
 pub fn build_manpages(outdir: &Path) -> Result<()> {
     for (name, cmd) in collect_commands() {
         let path = outdir.join(format!("{}.1", name.trim_start_matches('-')));
-        let mut f = File::create(&path)?;
+        let mut f = File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
         Man::new(cmd).render(&mut f)?;
     }
     Ok(())

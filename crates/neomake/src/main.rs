@@ -1,9 +1,13 @@
 use {
-    anyhow::Result,
-    std::path::PathBuf,
+    anyhow::{
+        Context,
+        Result,
+    },
+    std::io::IsTerminal,
 };
 
 mod args;
+mod cancel;
 mod exec;
 mod multiplex;
 mod plan;
@@ -29,17 +33,15 @@ async fn main() -> Result<()> {
 
     match cmd.command {
         | Command::Manual { path, format } => {
-            let out = PathBuf::from(path);
-            std::fs::create_dir_all(&out)?;
+            std::fs::create_dir_all(&path).with_context(|| format!("failed to create {}", path.display()))?;
             match format {
-                | ManualFormat::Manpages => reference::build_manpages(&out)?,
-                | ManualFormat::Markdown => reference::build_markdown(&out)?,
+                | ManualFormat::Manpages => reference::build_manpages(&path)?,
+                | ManualFormat::Markdown => reference::build_markdown(&path)?,
             }
         },
         | Command::Autocomplete { path, shell } => {
-            let out = PathBuf::from(path);
-            std::fs::create_dir_all(&out)?;
-            reference::build_shell_completion(&out, &shell)?;
+            std::fs::create_dir_all(&path).with_context(|| format!("failed to create {}", path.display()))?;
+            reference::build_shell_completion(&path, &shell)?;
         },
         | Command::Workflow(sub) => {
             match sub {
@@ -48,7 +50,10 @@ async fn main() -> Result<()> {
                 },
                 | WorkflowCommand::Init { template, output } => {
                     match output {
-                        | WorkflowInitOutput::File(f) => std::fs::write(f, template.render())?,
+                        | WorkflowInitOutput::File(path) => {
+                            std::fs::write(&path, template.render())
+                                .with_context(|| format!("failed to write {}", path.display()))?;
+                        },
                         | WorkflowInitOutput::Stdout => print!("{}", template.render()),
                     }
                 },
@@ -60,10 +65,10 @@ async fn main() -> Result<()> {
             args,
             pretty,
         } => {
+            let host = std::env::vars().collect();
             let w = Workflow::load(&workflow)?;
             let selected = nodes.select(&w)?;
-            let c = Compiler::new(w);
-            let p = c.plan(&selected, &args)?;
+            let p = Compiler::new(w).plan(&selected, &args, &host)?;
             if pretty {
                 print!("{}", serde_json::to_string_pretty(&p)?);
             } else {
@@ -80,8 +85,8 @@ async fn main() -> Result<()> {
         } => {
             runner::execute(
                 plan,
-                workers,
-                tui,
+                workers.get(),
+                tui.requested() && std::io::stderr().is_terminal(),
                 runner::PlainOutput {
                     stdout: !no_stdout,
                     stderr: !no_stderr,
@@ -91,47 +96,43 @@ async fn main() -> Result<()> {
             .await?;
         },
         | Command::List { workflow, format } => {
-            let w = Workflow::load(&workflow)?;
-            let c = Compiler::new(w);
-            c.list(&format).await?;
+            let listing = Compiler::new(Workflow::load(&workflow)?).list()?;
+            match format {
+                | crate::args::ListFormat::Json { pretty } => {
+                    let rendered = if pretty {
+                        serde_json::to_string_pretty(&listing)?
+                    } else {
+                        serde_json::to_string(&listing)?
+                    };
+                    println!("{rendered}");
+                },
+                | crate::args::ListFormat::Custom => {
+                    for node in &listing.nodes {
+                        println!("[{}]", node.name);
+                        if let Some(description) = &node.description {
+                            println!("{description}");
+                        }
+                        if let Some(pre) = &node.pre {
+                            println!("prerequisites: [\"{}\"]", pre.join("\", \""));
+                        }
+                        println!();
+                    }
+                },
+            }
         },
         | Command::Lint { workflow, json } => {
-            let w = Workflow::load(&workflow)?;
-            let c = Compiler::new(w);
-            let findings = c.lint()?;
-            let exit_code = if findings.iter().any(|f| matches!(f.level, plan::LintLevel::Error)) {
-                1
-            } else {
-                0
-            };
+            let findings = Compiler::new(Workflow::load(&workflow)?).lint()?;
             if json {
-                let out: Vec<_> = findings
-                    .iter()
-                    .map(|f| {
-                        serde_json::json!({
-                            "level": match f.level {
-                                plan::LintLevel::Error => "error",
-                                plan::LintLevel::Warn => "warn",
-                            },
-                            "node": f.node,
-                            "message": f.message,
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&out)?);
+                println!("{}", serde_json::to_string_pretty(&findings)?);
             } else if findings.is_empty() {
                 println!("ok — no findings");
             } else {
-                for f in &findings {
-                    let tag = match f.level {
-                        | plan::LintLevel::Error => "error",
-                        | plan::LintLevel::Warn => "warn",
-                    };
-                    println!("{:<5} [{}] {}", tag, f.node, f.message);
+                for finding in &findings {
+                    println!("{:<5} [{}] {}", finding.level, finding.node, finding.message);
                 }
             }
-            if exit_code != 0 {
-                std::process::exit(exit_code);
+            if findings.iter().any(|finding| finding.level == plan::LintLevel::Error) {
+                std::process::exit(1);
             }
         },
         | Command::Describe {
@@ -141,8 +142,13 @@ async fn main() -> Result<()> {
         } => {
             let w = Workflow::load(&workflow)?;
             let selected = nodes.select(&w)?;
-            let c = Compiler::new(w);
-            c.describe(&selected, pretty).await?;
+            let waves = Compiler::new(w).describe(&selected)?;
+            let rendered = if pretty {
+                serde_json::to_string_pretty(&waves)?
+            } else {
+                serde_json::to_string(&waves)?
+            };
+            println!("{rendered}");
         },
         | Command::Multiplex {
             commands,
@@ -152,7 +158,15 @@ async fn main() -> Result<()> {
             parallelism,
             tui,
         } => {
-            multiplex::run(program, commands, parallelism, print_stdout, stdout_pretty, tui).await?;
+            multiplex::run(
+                program,
+                commands,
+                parallelism.map(std::num::NonZeroUsize::get),
+                print_stdout,
+                stdout_pretty,
+                tui.requested() && std::io::stderr().is_terminal(),
+            )
+            .await?;
         },
         | Command::Watch {
             filter,
@@ -161,7 +175,7 @@ async fn main() -> Result<()> {
             commands,
             parallelism,
         } => {
-            multiplex::watch(filter, root, program, commands, parallelism).await?;
+            multiplex::watch(filter, root, program, commands, parallelism.get()).await?;
         },
     }
     Ok(())

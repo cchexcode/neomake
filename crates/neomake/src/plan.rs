@@ -1,188 +1,196 @@
 use {
-    crate::{
-        args::ListFormat,
-        workflow::{
-            ContainerConfig,
-            ContainerRuntime,
-            ContainerUser,
-            RetryPolicy,
-            WhenCondition,
-            Workflow,
-        },
+    crate::workflow::{
+        ContainerConfig,
+        ContainerRuntime,
+        ContainerUser,
+        RetryPolicy,
+        RuntimeExtras,
+        WhenCondition,
+        Workflow,
     },
     anyhow::{
         anyhow,
+        bail,
+        Context,
         Result,
     },
     std::{
         collections::{
+            BTreeMap,
+            BTreeSet,
             HashMap,
             HashSet,
             VecDeque,
         },
-        iter::FromIterator,
+        fmt,
     },
 };
 
-/// A fully-rendered execution plan, produced by the `plan` subcommand
-/// and consumed by `execute`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Fully resolved execution plan. Produced by `plan`, consumed by `execute`.
+///
+/// Every task already has its shell, env, retry, and container. Execute does
+/// not merge. A plan from a different neomake version is rejected.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct ExecutionPlan {
     pub version: String,
-    pub nodes: HashMap<String, Node>,
     pub stages: Vec<Stage>,
-    pub env: HashMap<String, String>,
+    pub nodes: BTreeMap<String, PlannedNode>,
 }
 
-/// A single DAG stage (wave). All nodes in a stage are independent and can
-/// run in parallel.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// One DAG wave. Nodes in a wave have no edges between them.
+///
+/// `nodes` is sorted. Order inside a wave does not affect execution.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Stage {
     pub nodes: Vec<String>,
 }
 
-/// A rendered node as it appears in the plan.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// A node after matrix expansion and guard evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub struct Node {
+pub struct PlannedNode {
     pub parallel: bool,
-    pub invocations: Vec<Invocation>,
-    pub tasks: Vec<Task>,
-    pub env: HashMap<String, String>,
-    pub shell: Option<String>,
-    pub workdir: Option<String>,
-    /// Resolved list of producer node names whose stdout is piped to this
-    /// node's stdin.
+    /// Direct scheduling edges (`pre` plus `inputs`), sorted and de-duplicated.
+    #[serde(default)]
+    pub deps: Vec<String>,
+    /// Producer nodes whose stdout is delivered on stdin, in declaration order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<String>,
-    /// Node-level retry policy (task-level `Task::retry` takes precedence).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry: Option<RetryPolicy>,
+    pub invocations: Vec<PlannedInvocation>,
 }
 
-/// A single matrix invocation: the coordinate vector and the env contribution.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+/// One matrix cell, or the single invocation of a node without a matrix.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub struct Invocation {
-    pub cell: Vec<u8>,
-    pub env: HashMap<String, String>,
-    /// Container config merged across workflow + node + all cells in this
-    /// invocation. Used as the base for this invocation's tasks; the
-    /// per-task `container` overlays.
+pub struct PlannedInvocation {
+    /// Per-dimension indices. Empty for a non-matrix node.
+    pub cell: Vec<u32>,
+    pub tasks: Vec<PlannedTask>,
+}
+
+/// One command, fully resolved for one invocation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct PlannedTask {
+    pub cmd: String,
+    pub shell: ShellSpec,
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<ResolvedContainer>,
 }
 
-/// Fully-resolved container config baked into the plan — no further merge at
-/// execute time.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+/// A non-empty shell invocation such as `/bin/sh -c`.
+///
+/// Stored as the original string so plans stay readable. Deserialization
+/// rejects an empty program so a hand-edited plan cannot smuggle one through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellSpec(String);
+
+impl ShellSpec {
+    pub fn sh() -> Self {
+        Self("/bin/sh -c".to_owned())
+    }
+
+    pub fn parse(shell: impl Into<String>) -> Result<Self> {
+        let shell = shell.into();
+        if shell.split_whitespace().next().is_none() {
+            bail!("empty shell specification");
+        }
+        Ok(Self(shell))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Program and the arguments that precede the script.
+    pub fn split(&self) -> Result<(&str, Vec<&str>)> {
+        let mut parts = self.as_str().split_whitespace();
+        let program = parts.next().ok_or_else(|| anyhow!("empty shell specification"))?;
+        Ok((program, parts.collect()))
+    }
+}
+
+impl serde::Serialize for ShellSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ShellSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::parse(s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Container config after the workflow → node → cell → task merge.
+/// Execute uses this as-is.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct ResolvedContainer {
     pub image: String,
     pub workdir: String,
     pub user: ContainerUser,
     pub mount: bool,
-    /// Runtime + its extras, inline. See `ContainerRuntime` for the variants.
     pub runtime: ContainerRuntime,
 }
 
-/// A rendered task.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub struct Task {
-    pub cmd: String,
-    pub env: HashMap<String, String>,
-    pub shell: Option<String>,
-    pub workdir: Option<String>,
-    /// Task-level retry policy (overrides the node's if present).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry: Option<RetryPolicy>,
-    /// Task-level container config, merged over workflow+node+cell.
-    /// Takes precedence over `Invocation::container` at execute time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub container: Option<ResolvedContainer>,
-}
-
-/// Merge a chain of optional `ContainerConfig` refs, innermost last. Returns
-/// `None` if no field was ever set or if the final `disabled == true`. Returns
-/// `Err` if any field is set but `image` is never set (user declared container
-/// fields without an image — likely a mistake; lint also catches this at
-/// compile time with a better message).
+/// Merge container layers, innermost last.
 ///
-/// `extra_args` for each runtime sub-block is **additive** across levels in the
-/// order given. Other fields are last-wins.
-pub fn merge_container(levels: &[Option<&ContainerConfig>]) -> Result<Option<ResolvedContainer>> {
-    use crate::workflow::RuntimeExtras;
-
+/// `None` if no field was set, or if the final `disabled` is true. Errors when
+/// a field is set but no image resolves. `extra_args` accumulate only while the
+/// runtime variant stays the same; a switch discards the previous variant's
+/// extras.
+pub(crate) fn merge_container(levels: &[Option<&ContainerConfig>]) -> Result<Option<ResolvedContainer>> {
     let mut any_field = false;
     let mut image: Option<String> = None;
     let mut workdir: Option<String> = None;
     let mut user: Option<ContainerUser> = None;
     let mut mount: Option<bool> = None;
     let mut disabled: Option<bool> = None;
-    // Runtime selection: last-wins for the variant. Extras accumulate only while
-    // consecutive layers declare the same variant; switching (e.g. docker →
-    // podman) discards the prior variant's extras.
     let mut runtime: Option<ContainerRuntime> = None;
 
-    for level in levels.iter().flatten() {
-        let c: &ContainerConfig = *level;
-        let declared = c.image.is_some()
-            || c.workdir.is_some()
-            || c.user.is_some()
-            || c.mount.is_some()
-            || c.disabled.is_some()
-            || c.runtime.is_some();
+    for level in levels.iter().flatten().copied() {
+        let declared = level.image.is_some()
+            || level.workdir.is_some()
+            || level.user.is_some()
+            || level.mount.is_some()
+            || level.disabled.is_some()
+            || level.runtime.is_some();
         if declared {
             any_field = true;
         }
-        if let Some(v) = &c.image {
+        if let Some(v) = &level.image {
             image = Some(v.clone());
         }
-        if let Some(v) = &c.workdir {
+        if let Some(v) = &level.workdir {
             workdir = Some(v.clone());
         }
-        if let Some(v) = &c.user {
+        if let Some(v) = &level.user {
             user = Some(v.clone());
         }
-        if let Some(v) = c.mount {
+        if let Some(v) = level.mount {
             mount = Some(v);
         }
-        if let Some(v) = c.disabled {
+        if let Some(v) = level.disabled {
             disabled = Some(v);
         }
-        if let Some(new_rt) = &c.runtime {
-            runtime = Some(match (runtime.take(), new_rt) {
-                | (Some(ContainerRuntime::Docker { docker: a }), ContainerRuntime::Docker { docker: b }) => {
-                    let mut ea = a.extra_args;
-                    ea.extend(b.extra_args.iter().cloned());
-                    ContainerRuntime::Docker {
-                        docker: RuntimeExtras { extra_args: ea },
-                    }
-                },
-                | (Some(ContainerRuntime::Podman { podman: a }), ContainerRuntime::Podman { podman: b }) => {
-                    let mut ea = a.extra_args;
-                    ea.extend(b.extra_args.iter().cloned());
-                    ContainerRuntime::Podman {
-                        podman: RuntimeExtras { extra_args: ea },
-                    }
-                },
-                // First declaration or a variant switch: take the new runtime as-is.
-                | (_, r) => r.clone(),
-            });
+        if let Some(new_rt) = &level.runtime {
+            runtime = Some(merge_runtime(runtime.take(), new_rt));
         }
     }
 
-    if !any_field {
-        return Ok(None);
-    }
-    if disabled == Some(true) {
+    if !any_field || disabled == Some(true) {
         return Ok(None);
     }
     let image = image.ok_or_else(|| anyhow!("container config declared but no image resolved"))?;
-
     Ok(Some(ResolvedContainer {
         image,
         workdir: workdir.unwrap_or_else(|| "/work".to_owned()),
@@ -192,13 +200,48 @@ pub fn merge_container(levels: &[Option<&ContainerConfig>]) -> Result<Option<Res
     }))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+fn merge_runtime(prev: Option<ContainerRuntime>, new_rt: &ContainerRuntime) -> ContainerRuntime {
+    match (prev, new_rt) {
+        | (Some(ContainerRuntime::Docker { docker: a }), ContainerRuntime::Docker { docker: b }) => {
+            ContainerRuntime::Docker {
+                docker: RuntimeExtras {
+                    extra_args: extend_args(a.extra_args, &b.extra_args),
+                },
+            }
+        },
+        | (Some(ContainerRuntime::Podman { podman: a }), ContainerRuntime::Podman { podman: b }) => {
+            ContainerRuntime::Podman {
+                podman: RuntimeExtras {
+                    extra_args: extend_args(a.extra_args, &b.extra_args),
+                },
+            }
+        },
+        | (_, rt) => rt.clone(),
+    }
+}
+
+fn extend_args(mut base: Vec<String>, extra: &[String]) -> Vec<String> {
+    base.extend(extra.iter().cloned());
+    base
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LintLevel {
     Error,
     Warn,
 }
 
-#[derive(Debug, Clone)]
+impl fmt::Display for LintLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            | Self::Error => "error",
+            | Self::Warn => "warn",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LintFinding {
     pub level: LintLevel,
     pub node: String,
@@ -206,25 +249,44 @@ pub struct LintFinding {
 }
 
 impl LintFinding {
-    fn error(node: impl Into<String>, message: String) -> Self {
+    fn error(node: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             level: LintLevel::Error,
             node: node.into(),
-            message,
+            message: message.into(),
         }
     }
 
-    fn warn(node: impl Into<String>, message: String) -> Self {
+    fn warn(node: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             level: LintLevel::Warn,
             node: node.into(),
-            message,
+            message: message.into(),
         }
     }
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct NodeList {
+    pub nodes: Vec<ListedNode>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ListedNode {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct WaveList {
+    pub stages: Vec<Vec<String>>,
+}
+
 pub struct Compiler {
-    pub workflow: Workflow,
+    workflow: Workflow,
 }
 
 impl Compiler {
@@ -232,113 +294,140 @@ impl Compiler {
         Self { workflow }
     }
 
-    /// Build an execution plan for the requested nodes (plus their transitive
-    /// prerequisites), ordered into DAG waves.
-    pub fn plan(&self, nodes: &HashSet<String>, args: &HashMap<String, String>) -> Result<ExecutionPlan> {
+    /// Compile `nodes` plus their transitive dependencies into a plan.
+    ///
+    /// `host` is the process environment captured by the caller. Capture
+    /// regexes read that map and nothing else. `when` script guards are the
+    /// one plan-time side effect: they spawn a process and include the node
+    /// on exit 0.
+    pub fn plan(
+        &self,
+        nodes: &HashSet<String>,
+        args: &HashMap<String, String>,
+        host: &HashMap<String, String>,
+    ) -> Result<ExecutionPlan> {
         let mut hb = handlebars::Handlebars::new();
         hb.set_strict_mode(true);
-        let arg_vals = self.compile_exec_args(args)?;
+        let arg_vals = compile_exec_args(args)?;
 
-        // Evaluate `when` guards first so disabled nodes are removed from the graph
-        // before ordering. Guards render with a non-strict handlebars — missing
-        // args are falsy, not errors. A node with a falsy guard is skipped
-        // entirely.
         let mut guard_hb = handlebars::Handlebars::new();
         guard_hb.set_strict_mode(false);
         let skipped = self.evaluate_guards(&guard_hb, &arg_vals)?;
-        let waves = self.determine_order_with_skips(nodes, &skipped)?;
+        let mut requested_skipped: Vec<_> = nodes.iter().filter(|n| skipped.contains(*n)).cloned().collect();
+        requested_skipped.sort();
+        if !requested_skipped.is_empty() {
+            bail!(
+                "requested node(s) skipped by `when` guard: {}",
+                requested_skipped.join(", ")
+            );
+        }
 
+        let ordered = self.order(nodes, &skipped)?;
         let mut plan = ExecutionPlan {
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            stages: vec![],
-            nodes: HashMap::new(),
-            env: match &self.workflow.env {
-                | Some(e) => e.compile()?,
-                | None => HashMap::new(),
-            },
+            stages: Vec::new(),
+            nodes: BTreeMap::new(),
         };
 
-        for wave in waves {
-            let mut stage = Stage { nodes: vec![] };
+        for wave in ordered.waves {
+            let mut stage = Stage { nodes: Vec::new() };
             for name in wave {
                 let def = &self.workflow.nodes[&name];
-                let resolved_inputs = self.resolve_inputs(def, &skipped)?;
-
-                let mut node = Node {
+                let inputs = self.resolve_inputs(def, &skipped)?;
+                let deps = ordered.deps.get(&name).cloned().unwrap_or_default();
+                let invocations = self.compile_invocations(def, &name, &hb, &arg_vals, host)?;
+                plan.nodes.insert(name.clone(), PlannedNode {
                     parallel: def.matrix.as_ref().map(|m| m.parallel).unwrap_or(false),
-                    invocations: vec![],
-                    tasks: vec![],
-                    env: match &def.env {
-                        | Some(e) => e.compile()?,
-                        | None => HashMap::new(),
-                    },
-                    shell: def.shell.clone(),
-                    workdir: def.workdir.clone(),
-                    inputs: resolved_inputs,
-                    retry: def.retry.clone(),
-                };
-
-                // Container merge layers outside the matrix: workflow → node.
-                let outer_container: Vec<Option<&ContainerConfig>> =
-                    vec![self.workflow.container.as_ref(), def.container.as_ref()];
-
-                // Compile invocations, threading container config through the matrix
-                // so each invocation gets its own merged ResolvedContainer.
-                node.invocations = match &def.matrix {
-                    | Some(m) => m.compile(&outer_container)?,
-                    | None => {
-                        let container = merge_container(&outer_container)?;
-                        vec![Invocation {
-                            cell: vec![],
-                            env: HashMap::new(),
-                            container,
-                        }]
-                    },
-                };
-
-                for task in &def.tasks {
-                    let cmd = hb.render_template(&task.script, &arg_vals)?;
-                    // Only populate task.container when the task itself declared a
-                    // `container` block. Otherwise leave it None so enumerate_batches
-                    // falls through to the invocation-level container (which carries
-                    // cell-specific overrides).
-                    let task_container = if task.container.is_some() {
-                        let mut task_layers: Vec<Option<&ContainerConfig>> = outer_container.clone();
-                        task_layers.push(task.container.as_ref());
-                        merge_container(&task_layers)?
-                    } else {
-                        None
-                    };
-
-                    node.tasks.push(Task {
-                        cmd,
-                        env: match &task.env {
-                            | Some(e) => e.compile()?,
-                            | None => HashMap::new(),
-                        },
-                        shell: task.shell.clone(),
-                        workdir: task.workdir.clone(),
-                        retry: task.retry.clone().or_else(|| def.retry.clone()),
-                        container: task_container,
-                    });
-                }
-
-                plan.nodes.insert(name.clone(), node);
+                    deps,
+                    inputs,
+                    invocations,
+                });
                 stage.nodes.push(name);
             }
             plan.stages.push(stage);
         }
-
         Ok(plan)
     }
 
-    /// Evaluate every node's `when` guard. Returns the set of node names that
-    /// should be omitted from the plan.
+    fn compile_invocations(
+        &self,
+        def: &crate::workflow::Node,
+        name: &str,
+        hb: &handlebars::Handlebars,
+        arg_vals: &serde_json::Value,
+        host: &HashMap<String, String>,
+    ) -> Result<Vec<PlannedInvocation>> {
+        let workflow_env = compile_env(self.workflow.env.as_ref(), host)?;
+        let node_env = compile_env(def.env.as_ref(), host)?;
+        let points = match &def.matrix {
+            | Some(m) => m.expand().with_context(|| format!("node `{name}`"))?,
+            | None => {
+                vec![crate::workflow::MatrixPoint {
+                    cell: vec![],
+                    parts: vec![],
+                }]
+            },
+        };
+
+        let mut invocations = Vec::with_capacity(points.len());
+        for point in points {
+            let mut cell_env = HashMap::<String, String>::new();
+            let mut cell_containers = Vec::new();
+            for part in &point.parts {
+                if let Some(env) = &part.env {
+                    cell_env.extend(env.compile(host)?);
+                }
+                cell_containers.push(part.container.as_ref());
+            }
+
+            let mut tasks = Vec::with_capacity(def.tasks.len());
+            for (task_idx, task) in def.tasks.iter().enumerate() {
+                let cmd = hb
+                    .render_template(&task.script, arg_vals)
+                    .with_context(|| format!("node `{name}` task {task_idx} template"))?;
+                let shell = match task.shell.as_ref().or(def.shell.as_ref()) {
+                    | Some(s) => ShellSpec::parse(s).with_context(|| format!("node `{name}` task {task_idx} shell"))?,
+                    | None => ShellSpec::sh(),
+                };
+                let mut env = BTreeMap::new();
+                env.extend(workflow_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+                env.extend(node_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+                env.extend(cell_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+                if let Some(task_env) = &task.env {
+                    env.extend(task_env.compile(host)?);
+                }
+
+                let mut layers = vec![self.workflow.container.as_ref(), def.container.as_ref()];
+                layers.extend(cell_containers.iter().copied());
+                layers.push(task.container.as_ref());
+                let container = merge_container(&layers).with_context(|| format!("node `{name}` task {task_idx}"))?;
+
+                tasks.push(PlannedTask {
+                    cmd,
+                    shell,
+                    env,
+                    workdir: task.workdir.clone().or_else(|| def.workdir.clone()),
+                    retry: task.retry.clone().or_else(|| def.retry.clone()),
+                    container,
+                });
+            }
+            invocations.push(PlannedInvocation {
+                cell: point.cell,
+                tasks,
+            });
+        }
+        Ok(invocations)
+    }
+
+    /// `when` guards. A falsy guard omits the node. Script guards spawn a
+    /// process.
     fn evaluate_guards(&self, hb: &handlebars::Handlebars, arg_vals: &serde_json::Value) -> Result<HashSet<String>> {
-        let mut skipped = HashSet::<String>::new();
+        let mut skipped = HashSet::new();
         for (name, def) in &self.workflow.nodes {
             if let Some(guard) = &def.when {
-                if !Self::guard_is_truthy(guard, hb, arg_vals)? {
+                let include =
+                    guard_is_truthy(guard, hb, arg_vals).with_context(|| format!("node `{name}` when guard failed"))?;
+                if !include {
                     skipped.insert(name.clone());
                 }
             }
@@ -346,52 +435,16 @@ impl Compiler {
         Ok(skipped)
     }
 
-    fn guard_is_truthy(
-        guard: &WhenCondition,
-        hb: &handlebars::Handlebars,
-        arg_vals: &serde_json::Value,
-    ) -> Result<bool> {
-        match guard {
-            | WhenCondition::Template(s) => {
-                let rendered = hb.render_template(s, arg_vals)?;
-                let t = rendered.trim();
-                Ok(!t.is_empty() && !matches!(t, "false" | "0" | "no"))
-            },
-            | WhenCondition::Script { script, shell } => {
-                let shell = shell.clone().unwrap_or_else(|| "/bin/sh -c".to_owned());
-                let mut parts = shell.split_whitespace();
-                let program = parts
-                    .next()
-                    .ok_or_else(|| anyhow!("empty shell specification in `when`"))?;
-                let mut cmd = std::process::Command::new(program);
-                for p in parts {
-                    cmd.arg(p);
-                }
-                cmd.arg(script)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-                let status = cmd.status()?;
-                Ok(status.success())
-            },
-        }
-    }
-
-    /// Resolve a node's `inputs` selectors to concrete node names, skipping any
-    /// that were guarded out. Errors if an input resolves to a node that
-    /// was skipped — depending on something that isn't going to run is a
-    /// workflow bug, not silent behavior.
     fn resolve_inputs(&self, def: &crate::workflow::Node, skipped: &HashSet<String>) -> Result<Vec<String>> {
-        let mut out = Vec::<String>::new();
+        let mut out = Vec::new();
         if let Some(inputs) = &def.inputs {
             for sel in inputs {
-                let matches = sel.resolve(self.workflow.nodes.keys())?;
-                for m in matches {
-                    if skipped.contains(&m) {
-                        return Err(anyhow!("input \"{}\" was skipped by its `when` guard", m));
+                for matched in sel.resolve(self.workflow.nodes.keys())? {
+                    if skipped.contains(&matched) {
+                        bail!("input \"{matched}\" was skipped by its `when` guard");
                     }
-                    if !out.contains(&m) {
-                        out.push(m);
+                    if !out.contains(&matched) {
+                        out.push(matched);
                     }
                 }
             }
@@ -399,313 +452,178 @@ impl Compiler {
         Ok(out)
     }
 
-    /// List all nodes. Output is either JSON or a plain custom format.
-    pub async fn list(&self, format: &ListFormat) -> Result<()> {
-        #[derive(Debug, serde::Serialize)]
-        struct Out {
-            nodes: Vec<OutNode>,
-        }
-        #[derive(Debug, serde::Serialize)]
-        struct OutNode {
-            name: String,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            description: Option<String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            pre: Option<Vec<String>>,
-        }
-
-        let mut info = Out {
-            nodes: self
-                .workflow
-                .nodes
-                .iter()
-                .map(|(name, def)| {
-                    OutNode {
-                        name: name.clone(),
-                        description: def.description.clone(),
-                        pre: def.pre.as_ref().map(|ps| {
-                            let mut out = Vec::<String>::new();
-                            for sel in ps {
-                                if let Ok(matches) = sel.resolve(self.workflow.nodes.keys()) {
-                                    out.extend(matches);
-                                }
+    /// Nodes in name order, with resolved `pre` selectors. Selector errors
+    /// propagate.
+    pub fn list(&self) -> Result<NodeList> {
+        let mut nodes = Vec::new();
+        for (name, def) in &self.workflow.nodes {
+            let pre = match &def.pre {
+                | Some(selectors) => {
+                    let mut out = Vec::new();
+                    for sel in selectors {
+                        for matched in sel.resolve(self.workflow.nodes.keys())? {
+                            if !out.contains(&matched) {
+                                out.push(matched);
                             }
-                            out
-                        }),
+                        }
                     }
-                })
-                .collect(),
-        };
-        info.nodes.sort_by(|a, b| a.name.cmp(&b.name));
-
-        match format {
-            | ListFormat::Json { pretty } => {
-                if *pretty {
-                    println!("{}", serde_json::to_string_pretty(&info)?);
-                } else {
-                    println!("{}", serde_json::to_string(&info)?);
-                }
-            },
-            | ListFormat::Custom => {
-                for n in &info.nodes {
-                    println!("[{}]", n.name);
-                    if let Some(d) = &n.description {
-                        println!("{}", d);
-                    }
-                    if let Some(pre) = &n.pre {
-                        println!("prerequisites: [\"{}\"]", pre.join("\", \""));
-                    }
-                    println!();
-                }
-            },
+                    Some(out)
+                },
+                | None => None,
+            };
+            nodes.push(ListedNode {
+                name: name.clone(),
+                description: def.description.clone(),
+                pre,
+            });
         }
-        Ok(())
+        nodes.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(NodeList { nodes })
     }
 
-    /// Static analysis of the workflow. Returns a list of findings. The caller
-    /// prints them and exits non-zero if any `Error`-level finding was
-    /// produced.
+    /// Static analysis. The caller exits non-zero on any error-level finding.
     pub fn lint(&self) -> Result<Vec<LintFinding>> {
-        let mut findings = Vec::<LintFinding>::new();
+        let mut findings = Vec::new();
         let node_names: HashSet<&String> = self.workflow.nodes.keys().collect();
 
         for (name, def) in &self.workflow.nodes {
-            // pre / inputs resolution
             for (field, list) in [("pre", def.pre.as_ref()), ("inputs", def.inputs.as_ref())] {
-                if let Some(entries) = list {
-                    for (idx, sel) in entries.iter().enumerate() {
-                        match sel {
-                            | crate::workflow::NodeSelector::Name { name: target } => {
-                                if !node_names.contains(target) {
-                                    findings.push(LintFinding::error(
-                                        name,
-                                        format!("{field}[{idx}] references missing node \"{target}\""),
-                                    ));
-                                }
-                            },
-                            | crate::workflow::NodeSelector::Regex { regex } => {
-                                let re = match fancy_regex::Regex::new(regex) {
-                                    | Ok(r) => r,
-                                    | Err(e) => {
-                                        findings.push(LintFinding::error(
+                let Some(entries) = list else {
+                    continue;
+                };
+                for (idx, sel) in entries.iter().enumerate() {
+                    match sel {
+                        | crate::workflow::NodeSelector::Name { name: target } => {
+                            if !node_names.contains(target) {
+                                findings.push(LintFinding::error(
+                                    name,
+                                    format!("{field}[{idx}] references missing node \"{target}\""),
+                                ));
+                            }
+                        },
+                        | crate::workflow::NodeSelector::Regex { regex } => {
+                            match fancy_regex::Regex::new(regex) {
+                                | Ok(re) => {
+                                    let matches = node_names.iter().any(|n| re.is_match(n).unwrap_or(false));
+                                    if !matches {
+                                        findings.push(LintFinding::warn(
                                             name,
-                                            format!("{field}[{idx}] invalid regex: {e}"),
+                                            format!("{field}[{idx}] regex \"{regex}\" matches no nodes"),
                                         ));
-                                        continue;
-                                    },
-                                };
-                                let matches = node_names.iter().any(|n| re.is_match(n).unwrap_or(false));
-                                if !matches {
-                                    findings.push(LintFinding::warn(
-                                        name,
-                                        format!("{field}[{idx}] regex \"{regex}\" matches no nodes"),
-                                    ));
-                                }
-                            },
-                        }
+                                    }
+                                },
+                                | Err(e) => {
+                                    findings
+                                        .push(LintFinding::error(name, format!("{field}[{idx}] invalid regex: {e}")))
+                                },
+                            }
+                        },
                     }
                 }
             }
 
-            // matrix shape
-            if let Some(m) = &def.matrix {
-                if m.dimensions.iter().any(|d| d.is_empty()) {
-                    findings.push(LintFinding::error(name, "matrix has an empty dimension".to_owned()));
-                }
-                if m.dimensions.is_empty() {
+            if let Some(matrix) = &def.matrix {
+                if matrix.dimensions.is_empty() {
                     findings.push(LintFinding::warn(
                         name,
-                        "matrix declared but has zero dimensions (no invocations)".to_owned(),
+                        "matrix has zero dimensions; treated as a single invocation",
                     ));
+                } else if let Err(e) = matrix.expand() {
+                    findings.push(LintFinding::error(name, e.to_string()));
                 }
             }
 
-            // env captures compile
-            if let Some(env) = &def.env {
-                if let Some(rgx) = &env.capture {
-                    if let Err(e) = fancy_regex::Regex::new(rgx) {
-                        findings.push(LintFinding::error(name, format!("env.capture invalid regex: {e}")));
-                    }
-                }
+            lint_shell(name, def.shell.as_deref(), &mut findings);
+            if let Some(WhenCondition::Script { shell: Some(shell), .. }) = &def.when {
+                lint_shell(name, Some(shell), &mut findings);
             }
-            for task in &def.tasks {
-                if let Some(env) = &task.env {
-                    if let Some(rgx) = &env.capture {
-                        if let Err(e) = fancy_regex::Regex::new(rgx) {
-                            findings.push(LintFinding::error(name, format!("task env.capture invalid regex: {e}")));
-                        }
-                    }
-                }
+            lint_env_capture(name, "env.capture", def.env.as_ref(), &mut findings);
+            for (task_idx, task) in def.tasks.iter().enumerate() {
+                lint_shell(name, task.shell.as_deref(), &mut findings);
+                lint_env_capture(
+                    name,
+                    &format!("tasks[{task_idx}].env.capture"),
+                    task.env.as_ref(),
+                    &mut findings,
+                );
             }
         }
 
-        // Workflow-level env capture regex.
-        if let Some(env) = &self.workflow.env {
-            if let Some(rgx) = &env.capture {
-                if let Err(e) = fancy_regex::Regex::new(rgx) {
-                    findings.push(LintFinding::error(
-                        "<workflow>",
-                        format!("env.capture invalid regex: {e}"),
-                    ));
+        lint_env_capture("<workflow>", "env.capture", self.workflow.env.as_ref(), &mut findings);
+        lint_container_block("<workflow>", self.workflow.container.as_ref(), &mut findings);
+        for (name, def) in &self.workflow.nodes {
+            lint_container_block(name, def.container.as_ref(), &mut findings);
+            if let Some(matrix) = &def.matrix {
+                for (dim_idx, dim) in matrix.dimensions.iter().enumerate() {
+                    for (cell_idx, cell) in dim.iter().enumerate() {
+                        lint_container_block(
+                            &format!("{name}.matrix[{dim_idx}][{cell_idx}]"),
+                            cell.container.as_ref(),
+                            &mut findings,
+                        );
+                    }
                 }
             }
+            for (task_idx, task) in def.tasks.iter().enumerate() {
+                lint_container_block(
+                    &format!("{name}.tasks[{task_idx}]"),
+                    task.container.as_ref(),
+                    &mut findings,
+                );
+            }
+            self.lint_resolved_containers(name, def, &mut findings);
         }
 
-        // Cycle detection over the full graph (both pre and inputs are structural
-        // edges).
         let all = node_names.iter().map(|s| (*s).clone()).collect::<HashSet<_>>();
-        if let Err(e) = self.determine_order(&all) {
-            findings.push(LintFinding::error("<graph>", format!("{e}")));
+        if let Err(e) = self.order(&all, &HashSet::new()) {
+            findings.push(LintFinding::error("<graph>", e.to_string()));
         }
-
-        // Container config validity at every scope.
-        Self::lint_container_block("<workflow>", self.workflow.container.as_ref(), &mut findings);
-        for (name, def) in &self.workflow.nodes {
-            Self::lint_container_block(name, def.container.as_ref(), &mut findings);
-            if let Some(matrix) = &def.matrix {
-                for (dim_idx, dim) in matrix.dimensions.iter().enumerate() {
-                    for (cell_idx, cell) in dim.iter().enumerate() {
-                        let scope = format!("{name}.matrix[{dim_idx}][{cell_idx}]");
-                        Self::lint_container_block(&scope, cell.container.as_ref(), &mut findings);
-                    }
-                }
-            }
-            for (task_idx, task) in def.tasks.iter().enumerate() {
-                let scope = format!("{name}.tasks[{task_idx}]");
-                Self::lint_container_block(&scope, task.container.as_ref(), &mut findings);
-            }
-        }
-
-        // Each task must have a resolvable container when any of its merge layers
-        // declare one. We attempt the same merge the compiler does and surface
-        // image-missing as a lint error for every affected task.
-        for (name, def) in &self.workflow.nodes {
-            let outer: Vec<Option<&ContainerConfig>> = vec![self.workflow.container.as_ref(), def.container.as_ref()];
-            // Check task-scoped merge for every task — stand-alone so a cell-only
-            // declaration (which would be caught below) isn't double-reported
-            // here.
-            for (task_idx, task) in def.tasks.iter().enumerate() {
-                let mut layers = outer.clone();
-                layers.push(task.container.as_ref());
-                if let Err(e) = merge_container(&layers) {
-                    findings.push(LintFinding::error(name, format!("tasks[{task_idx}]: {e}")));
-                }
-            }
-            // Check invocation-scoped merge per cell combination, flagging cell-only decls
-            // that don't resolve.
-            if let Some(matrix) = &def.matrix {
-                for (dim_idx, dim) in matrix.dimensions.iter().enumerate() {
-                    for (cell_idx, cell) in dim.iter().enumerate() {
-                        let mut layers = outer.clone();
-                        layers.push(cell.container.as_ref());
-                        if let Err(e) = merge_container(&layers) {
-                            findings.push(LintFinding::error(name, format!("matrix[{dim_idx}][{cell_idx}]: {e}")));
-                        }
-                    }
-                }
-            }
-        }
-
         Ok(findings)
     }
 
-    fn lint_container_block(scope: &str, cfg: Option<&ContainerConfig>, out: &mut Vec<LintFinding>) {
-        let Some(cfg) = cfg else {
-            return;
+    fn lint_resolved_containers(&self, name: &str, def: &crate::workflow::Node, findings: &mut Vec<LintFinding>) {
+        let cell_sets: Vec<Vec<Option<ContainerConfig>>> = match &def.matrix {
+            | None => vec![Vec::new()],
+            | Some(matrix) => {
+                match matrix.expand() {
+                    | Ok(points) => {
+                        points
+                            .into_iter()
+                            .map(|point| point.parts.into_iter().map(|cell| cell.container.clone()).collect())
+                            .collect()
+                    },
+                    | Err(_) => return,
+                }
+            },
         };
-        // Reserved args that neomake supplies itself; overriding them is likely a bug.
-        const RESERVED: &[&str] = &["-i", "-t", "--rm", "-w", "--workdir", "-v", "--volume"];
-        if let Some(runtime) = &cfg.runtime {
-            let (name, extras) = match runtime {
-                | ContainerRuntime::Docker { docker } => ("docker", docker),
-                | ContainerRuntime::Podman { podman } => ("podman", podman),
-            };
-            for a in &extras.extra_args {
-                let bare = a.split('=').next().unwrap_or(a);
-                if RESERVED.contains(&bare) {
-                    out.push(LintFinding::warn(
-                        scope,
-                        format!(
-                            "container.runtime.{name}.extra_args: `{a}` is controlled by neomake, override may be \
-                             ignored"
-                        ),
-                    ));
+        for (task_idx, task) in def.tasks.iter().enumerate() {
+            for cells in &cell_sets {
+                let mut layers = vec![self.workflow.container.as_ref(), def.container.as_ref()];
+                layers.extend(cells.iter().map(Option::as_ref));
+                layers.push(task.container.as_ref());
+                if let Err(e) = merge_container(&layers) {
+                    findings.push(LintFinding::error(name, format!("tasks[{task_idx}]: {e}")));
+                    break;
                 }
             }
         }
     }
 
-    /// Print DAG waves as JSON.
-    pub async fn describe(&self, nodes: &HashSet<String>, pretty: bool) -> Result<()> {
-        let waves = self.determine_order(nodes)?;
-        #[derive(Debug, serde::Serialize)]
-        struct Out {
-            stages: Vec<Vec<String>>,
-        }
-        let info = Out {
-            stages: waves.into_iter().map(|w| w.into_iter().collect::<Vec<_>>()).collect(),
-        };
-        if pretty {
-            println!("{}", serde_json::to_string_pretty(&info)?);
-        } else {
-            println!("{}", serde_json::to_string(&info)?);
-        }
-        Ok(())
+    /// DAG waves for `nodes` plus transitive `pre` and `inputs`. Does not apply
+    /// guards.
+    pub fn describe(&self, nodes: &HashSet<String>) -> Result<WaveList> {
+        Ok(WaveList {
+            stages: self.order(nodes, &HashSet::new())?.waves,
+        })
     }
 
-    /// Expand `--arg foo.bar=value` pairs into a nested JSON tree used by
-    /// handlebars (so templates may reference `{{ foo.bar }}`).
-    fn compile_exec_args(&self, args: &HashMap<String, String>) -> Result<serde_json::Value> {
-        fn add(namespace: &mut VecDeque<String>, parent: &mut serde_json::Value, value: &str) {
-            let key = namespace.pop_front().unwrap();
-            match namespace.len() {
-                | 0 => {
-                    parent
-                        .as_object_mut()
-                        .unwrap()
-                        .entry(&key)
-                        .or_insert(serde_json::Value::String(value.to_owned()));
-                },
-                | _ => {
-                    let child = parent
-                        .as_object_mut()
-                        .unwrap()
-                        .entry(&key)
-                        .or_insert(serde_json::Value::Object(serde_json::Map::new()));
-                    add(namespace, child, value);
-                },
-            }
-        }
+    fn order(&self, roots: &HashSet<String>, skipped: &HashSet<String>) -> Result<Ordered> {
+        let mut deps = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut seen = BTreeSet::new();
+        let mut pending = VecDeque::new();
+        pending.extend(roots.iter().filter(|n| !skipped.contains(*n)).cloned());
 
-        let mut root = serde_json::Value::Object(serde_json::Map::new());
-        for (k, v) in args {
-            let parts: Vec<String> = k.split('.').map(|s| s.to_string()).collect();
-            let mut q = VecDeque::from(parts);
-            add(&mut q, &mut root, v);
-        }
-        Ok(root)
-    }
-
-    /// Topologically group nodes into waves. All nodes within a wave are
-    /// independent. Errors on cycles and unknown nodes.
-    fn determine_order(&self, exec: &HashSet<String>) -> Result<Vec<HashSet<String>>> {
-        self.determine_order_with_skips(exec, &HashSet::new())
-    }
-
-    /// Topologically group nodes into waves, omitting anything in `skipped`.
-    /// Dependencies of a requested node from both `pre` and `inputs` are
-    /// honored.
-    fn determine_order_with_skips(
-        &self,
-        exec: &HashSet<String>,
-        skipped: &HashSet<String>,
-    ) -> Result<Vec<HashSet<String>>> {
-        let mut deps = HashMap::<String, Vec<String>>::new();
-        let mut seen = HashSet::<String>::new();
-        let mut pending = VecDeque::<String>::new();
-        pending.extend(exec.iter().filter(|n| !skipped.contains(*n)).cloned());
-
-        while let Some(next) = pending.pop_back() {
+        while let Some(next) = pending.pop_front() {
             if !seen.insert(next.clone()) {
                 continue;
             }
@@ -713,48 +631,719 @@ impl Compiler {
                 .workflow
                 .nodes
                 .get(&next)
-                .ok_or_else(|| anyhow!("node not found: {}", next))?;
-            let mut pre_nodes = Vec::<String>::new();
-            if let Some(pre) = &def.pre {
-                for sel in pre {
-                    for m in sel.resolve(self.workflow.nodes.keys())? {
-                        if !skipped.contains(&m) && !pre_nodes.contains(&m) {
-                            pre_nodes.push(m);
+                .ok_or_else(|| anyhow!("node not found: {next}"))?;
+            let mut pre = BTreeSet::new();
+            for selectors in [&def.pre, &def.inputs] {
+                let Some(selectors) = selectors else {
+                    continue;
+                };
+                for sel in selectors {
+                    for matched in sel.resolve(self.workflow.nodes.keys())? {
+                        if !skipped.contains(&matched) {
+                            pre.insert(matched);
                         }
                     }
                 }
             }
-            // `inputs` imply `pre` — you can't read the stdout of a node that hasn't run.
-            if let Some(inputs) = &def.inputs {
-                for sel in inputs {
-                    for m in sel.resolve(self.workflow.nodes.keys())? {
-                        if !skipped.contains(&m) && !pre_nodes.contains(&m) {
-                            pre_nodes.push(m);
-                        }
-                    }
-                }
-            }
-            deps.insert(next, pre_nodes.clone());
-            pending.extend(pre_nodes);
+            pending.extend(pre.iter().cloned());
+            deps.insert(next, pre);
         }
 
-        let mut settled = HashSet::<String>::new();
-        let mut waves = Vec::<HashSet<String>>::new();
-        while !deps.is_empty() {
-            let leaves = deps
+        let mut remaining = deps.clone();
+        let mut settled = BTreeSet::new();
+        let mut waves = Vec::new();
+        while !remaining.is_empty() {
+            let leaves: Vec<String> = remaining
                 .iter()
-                .filter(|(_, d)| d.iter().all(|x| settled.contains(x)))
-                .map(|(k, _)| k.clone())
-                .collect::<Vec<_>>();
+                .filter(|(_, edges)| edges.iter().all(|edge| settled.contains(edge)))
+                .map(|(name, _)| name.clone())
+                .collect();
             if leaves.is_empty() {
-                return Err(anyhow!("cycle detected in DAG"));
+                let stuck = remaining.keys().cloned().collect::<Vec<_>>().join(", ");
+                bail!("cycle detected in DAG: {stuck}");
             }
-            for k in &leaves {
-                deps.remove(k);
+            for name in &leaves {
+                remaining.remove(name);
             }
             settled.extend(leaves.iter().cloned());
-            waves.push(HashSet::from_iter(leaves));
+            waves.push(leaves);
         }
-        Ok(waves)
+
+        let deps = deps
+            .into_iter()
+            .map(|(name, edges)| (name, edges.into_iter().collect()))
+            .collect();
+        Ok(Ordered { waves, deps })
+    }
+}
+
+struct Ordered {
+    waves: Vec<Vec<String>>,
+    deps: BTreeMap<String, Vec<String>>,
+}
+
+fn compile_env(env: Option<&crate::workflow::Env>, host: &HashMap<String, String>) -> Result<HashMap<String, String>> {
+    match env {
+        | Some(env) => env.compile(host),
+        | None => Ok(HashMap::new()),
+    }
+}
+
+fn lint_shell(node: &str, shell: Option<&str>, findings: &mut Vec<LintFinding>) {
+    if let Some(shell) = shell {
+        if ShellSpec::parse(shell).is_err() {
+            findings.push(LintFinding::error(node, format!("empty shell specification `{shell}`")));
+        }
+    }
+}
+
+fn lint_env_capture(node: &str, field: &str, env: Option<&crate::workflow::Env>, findings: &mut Vec<LintFinding>) {
+    let Some(regex) = env.and_then(|e| e.capture.as_ref()) else {
+        return;
+    };
+    if let Err(e) = fancy_regex::Regex::new(regex) {
+        findings.push(LintFinding::error(node, format!("{field} invalid regex: {e}")));
+    }
+}
+
+fn lint_container_block(scope: &str, cfg: Option<&ContainerConfig>, out: &mut Vec<LintFinding>) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    const RESERVED: &[&str] = &["-i", "-t", "--rm", "-w", "--workdir", "-v", "--volume"];
+    let Some(runtime) = &cfg.runtime else {
+        return;
+    };
+    let (name, extras) = match runtime {
+        | ContainerRuntime::Docker { docker } => ("docker", docker),
+        | ContainerRuntime::Podman { podman } => ("podman", podman),
+    };
+    for arg in &extras.extra_args {
+        let bare = arg.split('=').next().unwrap_or(arg);
+        if RESERVED.contains(&bare) {
+            out.push(LintFinding::warn(
+                scope,
+                format!(
+                    "container.runtime.{name}.extra_args: `{arg}` is controlled by neomake; override may be ignored"
+                ),
+            ));
+        }
+    }
+}
+
+fn guard_is_truthy(guard: &WhenCondition, hb: &handlebars::Handlebars, arg_vals: &serde_json::Value) -> Result<bool> {
+    match guard {
+        | WhenCondition::Template(template) => {
+            let rendered = hb.render_template(template, arg_vals)?;
+            let trimmed = rendered.trim();
+            Ok(!trimmed.is_empty() && !matches!(trimmed, "false" | "0" | "no"))
+        },
+        | WhenCondition::Script { script, shell } => {
+            let spec = match shell {
+                | Some(shell) => ShellSpec::parse(shell)?,
+                | None => ShellSpec::sh(),
+            };
+            let (program, args) = spec.split()?;
+            let mut cmd = std::process::Command::new(program);
+            for arg in args {
+                cmd.arg(arg);
+            }
+            let status = cmd
+                .arg(script)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .with_context(|| format!("failed to run `when` script `{script}`"))?;
+            Ok(status.success())
+        },
+    }
+}
+
+/// Expand `key=value` pairs into the JSON tree handlebars reads.
+///
+/// `a.b=1` becomes `{ "a": { "b": "1" } }`. Empty segments and a path that is
+/// both a value and an object are errors — those plans would otherwise render
+/// the wrong argument or panic.
+fn compile_exec_args(args: &HashMap<String, String>) -> Result<serde_json::Value> {
+    let mut root = serde_json::Map::new();
+    let mut keys: Vec<_> = args.keys().collect();
+    keys.sort();
+    for key in keys {
+        insert_arg(&mut root, key, &args[key])?;
+    }
+    Ok(serde_json::Value::Object(root))
+}
+
+fn insert_arg(root: &mut serde_json::Map<String, serde_json::Value>, key: &str, value: &str) -> Result<()> {
+    if key.is_empty() || key.split('.').any(|part| part.is_empty()) {
+        bail!("arg key `{key}` is empty or has an empty segment");
+    }
+    let parts: Vec<&str> = key.split('.').collect();
+    insert_at(root, &parts, value, key)
+}
+
+fn insert_at(
+    node: &mut serde_json::Map<String, serde_json::Value>,
+    parts: &[&str],
+    value: &str,
+    full: &str,
+) -> Result<()> {
+    let Some((head, rest)) = parts.split_first() else {
+        bail!("arg key `{full}` is empty");
+    };
+    if rest.is_empty() {
+        match node.get(*head) {
+            | Some(serde_json::Value::String(existing)) if existing == value => Ok(()),
+            | Some(_) => bail!("arg `{full}` conflicts with an earlier arg"),
+            | None => {
+                node.insert((*head).to_owned(), serde_json::Value::String(value.to_owned()));
+                Ok(())
+            },
+        }
+    } else {
+        let entry = node
+            .entry((*head).to_owned())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        match entry {
+            | serde_json::Value::Object(map) => insert_at(map, rest, value, full),
+            | _ => bail!("arg `{full}` conflicts with an earlier arg"),
+        }
+    }
+}
+
+/// Longest chain through `deps`, weighted by per-node duration.
+///
+/// Ties prefer the lexicographically later end node, then the earlier sorted
+/// dependency, so the path is stable. Returns `None` when every weight is 0.
+pub(crate) fn critical_path(plan: &ExecutionPlan, weight: &HashMap<String, u128>) -> Option<(Vec<String>, u128)> {
+    let mut best = BTreeMap::<String, (u128, Option<String>)>::new();
+    for stage in &plan.stages {
+        for name in &stage.nodes {
+            let Some(node) = plan.nodes.get(name) else {
+                continue;
+            };
+            let w = weight.get(name).copied().unwrap_or(0);
+            let mut chosen = (w, None);
+            for dep in &node.deps {
+                if let Some((dep_total, _)) = best.get(dep) {
+                    let candidate = dep_total.saturating_add(w);
+                    if candidate > chosen.0 {
+                        chosen = (candidate, Some(dep.clone()));
+                    }
+                }
+            }
+            best.insert(name.clone(), chosen);
+        }
+    }
+    let (end, (total, _)) = best.iter().max_by_key(|(_, (total, _))| *total)?;
+    if *total == 0 {
+        return None;
+    }
+    let mut path = Vec::new();
+    let mut cur = Some(end.clone());
+    while let Some(name) = cur {
+        path.push(name.clone());
+        cur = best.get(&name).and_then(|(_, parent)| parent.clone());
+    }
+    path.reverse();
+    Some((path, *total))
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::workflow::{
+            ContainerConfig,
+            ContainerRuntime,
+            RuntimeExtras,
+        },
+    };
+
+    fn dedent(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().filter(|line| !line.trim().is_empty()).collect();
+        let indent = lines
+            .iter()
+            .map(|line| line.len() - line.trim_start().len())
+            .min()
+            .unwrap_or(0);
+        lines
+            .into_iter()
+            .map(|line| line.get(indent..).unwrap_or(line.trim()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn plan_src(src: &str, nodes: &[&str], args: &[(&str, &str)], host: &[(&str, &str)]) -> Result<ExecutionPlan> {
+        let wf = Workflow::parse(&dedent(src))?;
+        let selected = nodes.iter().map(|s| (*s).to_owned()).collect();
+        let args = args.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+        let host = host.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+        Compiler::new(wf).plan(&selected, &args, &host)
+    }
+
+    #[test]
+    fn plan_resolves_env_container_and_is_stable() {
+        let src = r#"
+            version = "0.0"
+            env {
+              capture = "^CAPTURED$"
+              vars {
+                K = "wf"
+                SHARED = "wf"
+              }
+            }
+            container {
+              image = "alpine:base"
+              runtime {
+                docker {
+                  extra_args = [ "--from=wf" ]
+                }
+              }
+            }
+            nodes {
+              build {
+                env {
+                  vars { K = "node" }
+                }
+                matrix {
+                  parallel = true
+                  dimensions = [
+                    [
+                      {
+                        env {
+                          vars { K = "cell" }
+                        }
+                        container {
+                          image = "debian:cell"
+                          runtime {
+                            docker {
+                              extra_args = [ "--from=cell" ]
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  ]
+                }
+                tasks = [
+                  {
+                    script = "echo {{ args.msg }}"
+                    env {
+                      vars {
+                        K = "task"
+                        ONLY_TASK = "1"
+                      }
+                    }
+                    container {
+                      workdir = "/app"
+                    }
+                  }
+                ]
+              }
+            }
+        "#;
+        let host = [("CAPTURED", "yes"), ("OTHER", "no")];
+        let plan = plan_src(src, &["build"], &[("args.msg", "hi")], &host).unwrap();
+        let again = plan_src(src, &["build"], &[("args.msg", "hi")], &host).unwrap();
+        assert_eq!(plan, again);
+
+        let task = &plan.nodes["build"].invocations[0].tasks[0];
+        assert_eq!(task.cmd, "echo hi");
+        assert_eq!(task.shell.as_str(), "/bin/sh -c");
+        assert_eq!(task.env.get("K").map(String::as_str), Some("task"));
+        assert_eq!(task.env.get("SHARED").map(String::as_str), Some("wf"));
+        assert_eq!(task.env.get("ONLY_TASK").map(String::as_str), Some("1"));
+        assert_eq!(task.env.get("CAPTURED").map(String::as_str), Some("yes"));
+        assert!(!task.env.contains_key("OTHER"));
+        let container = task.container.as_ref().unwrap();
+        assert_eq!(container.image, "debian:cell");
+        assert_eq!(container.workdir, "/app");
+        assert_eq!(container.user, ContainerUser::Host);
+        match &container.runtime {
+            | ContainerRuntime::Docker { docker } => {
+                assert_eq!(docker.extra_args, vec![
+                    "--from=wf".to_owned(),
+                    "--from=cell".to_owned()
+                ]);
+            },
+            | ContainerRuntime::Podman { .. } => panic!("expected docker"),
+        }
+    }
+
+    #[test]
+    fn runtime_switch_discards_previous_extras_and_disable_opts_out() {
+        let switched = plan_src(
+            r#"
+                version = "0.0"
+                container {
+                  image = "alpine"
+                  runtime {
+                    docker {
+                      extra_args = [ "--from=docker" ]
+                    }
+                  }
+                }
+                nodes {
+                  t {
+                    tasks = [
+                      {
+                        script = "true"
+                        container {
+                          runtime {
+                            podman {
+                              extra_args = [ "--from=podman" ]
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+            "#,
+            &["t"],
+            &[],
+            &[],
+        )
+        .unwrap();
+        match &switched.nodes["t"].invocations[0].tasks[0]
+            .container
+            .as_ref()
+            .unwrap()
+            .runtime
+        {
+            | ContainerRuntime::Podman { podman } => assert_eq!(podman.extra_args, vec!["--from=podman".to_owned()]),
+            | ContainerRuntime::Docker { .. } => panic!("expected podman"),
+        }
+
+        let disabled = plan_src(
+            r#"
+                version = "0.0"
+                container {
+                  image = "alpine"
+                }
+                nodes {
+                  t {
+                    container {
+                      disabled = true
+                    }
+                    tasks = [
+                      { script = "true" }
+                    ]
+                  }
+                }
+            "#,
+            &["t"],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(disabled.nodes["t"].invocations[0].tasks[0].container.is_none());
+    }
+
+    #[test]
+    fn container_user_literal_round_trips_through_hocon() {
+        let plan = plan_src(
+            r#"
+                version = "0.0"
+                container {
+                  image = "alpine"
+                  user = "1000:1000"
+                }
+                nodes {
+                  t {
+                    tasks = [
+                      { script = "true" }
+                    ]
+                  }
+                }
+            "#,
+            &["t"],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            plan.nodes["t"].invocations[0].tasks[0].container.as_ref().unwrap().user,
+            ContainerUser::Explicit("1000:1000".to_owned())
+        );
+    }
+
+    #[test]
+    fn guards_cycles_args_and_wave_order() {
+        let err = plan_src(
+            r#"
+                version = "0.0"
+                nodes {
+                  a {
+                    when = "false"
+                    tasks = [
+                      { script = "true" }
+                    ]
+                  }
+                }
+            "#,
+            &["a"],
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("skipped by"), "{err}");
+
+        let plan = plan_src(
+            r#"
+                version = "0.0"
+                nodes {
+                  a {
+                    when = "false"
+                    tasks = [
+                      { script = "true" }
+                    ]
+                  }
+                  b {
+                    pre = [
+                      { name = "a" }
+                    ]
+                    tasks = [
+                      { script = "true" }
+                    ]
+                  }
+                }
+            "#,
+            &["b"],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(plan.stages.len(), 1);
+        assert_eq!(plan.stages[0].nodes, vec!["b".to_owned()]);
+        assert!(plan.nodes["b"].deps.is_empty());
+
+        let err = plan_src(
+            r#"
+                version = "0.0"
+                nodes {
+                  a {
+                    when = "false"
+                    tasks = [
+                      { script = "echo x" }
+                    ]
+                  }
+                  b {
+                    inputs = [
+                      { name = "a" }
+                    ]
+                    tasks = [
+                      { script = "cat" }
+                    ]
+                  }
+                }
+            "#,
+            &["b"],
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("skipped"), "{err}");
+
+        let err = plan_src(
+            r#"
+                version = "0.0"
+                nodes {
+                  a {
+                    pre = [
+                      { name = "b" }
+                    ]
+                    tasks = [
+                      { script = "true" }
+                    ]
+                  }
+                  b {
+                    pre = [
+                      { name = "a" }
+                    ]
+                    tasks = [
+                      { script = "true" }
+                    ]
+                  }
+                }
+            "#,
+            &["a"],
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cycle detected"), "{err}");
+
+        let err = plan_src(
+            r#"
+                version = "0.0"
+                nodes {
+                  a {
+                    tasks = [
+                      { script = "echo {{ args.foo }}" }
+                    ]
+                  }
+                }
+            "#,
+            &["a"],
+            &[("foo", "1"), ("foo.bar", "2")],
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("conflicts"), "{err}");
+
+        let plan = plan_src(
+            r#"
+                version = "0.0"
+                nodes {
+                  b {
+                    tasks = [
+                      { script = "true" }
+                    ]
+                  }
+                  a {
+                    tasks = [
+                      { script = "true" }
+                    ]
+                  }
+                }
+            "#,
+            &["b", "a"],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(plan.stages[0].nodes, vec!["a".to_owned(), "b".to_owned()]);
+    }
+
+    #[test]
+    fn missing_image_and_empty_shell_fail_closed() {
+        assert!(plan_src(
+            r#"
+                version = "0.0"
+                nodes {
+                  a {
+                    container {
+                      workdir = "/x"
+                    }
+                    tasks = [
+                      { script = "true" }
+                    ]
+                  }
+                }
+            "#,
+            &["a"],
+            &[],
+            &[],
+        )
+        .is_err());
+        assert!(plan_src(
+            r#"
+                version = "0.0"
+                nodes {
+                  a {
+                    shell = "   "
+                    tasks = [
+                      { script = "true" }
+                    ]
+                  }
+                }
+            "#,
+            &["a"],
+            &[],
+            &[],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn merge_container_rules() {
+        let base = ContainerConfig {
+            image: Some("alpine".to_owned()),
+            runtime: Some(ContainerRuntime::Docker {
+                docker: RuntimeExtras {
+                    extra_args: vec!["--a".to_owned()],
+                },
+            }),
+            ..ContainerConfig::default()
+        };
+        let switched = ContainerConfig {
+            runtime: Some(ContainerRuntime::Podman {
+                podman: RuntimeExtras {
+                    extra_args: vec!["--b".to_owned()],
+                },
+            }),
+            ..ContainerConfig::default()
+        };
+        let resolved = merge_container(&[Some(&base), Some(&switched)]).unwrap().unwrap();
+        assert_eq!(resolved.image, "alpine");
+        assert!(matches!(resolved.runtime, ContainerRuntime::Podman { .. }));
+
+        let disabled = ContainerConfig {
+            image: Some("alpine".to_owned()),
+            disabled: Some(true),
+            ..ContainerConfig::default()
+        };
+        assert!(merge_container(&[Some(&disabled)]).unwrap().is_none());
+        assert!(merge_container(&[]).unwrap().is_none());
+        let bare = ContainerConfig {
+            workdir: Some("/x".to_owned()),
+            ..ContainerConfig::default()
+        };
+        assert!(merge_container(&[Some(&bare)]).is_err());
+    }
+
+    #[test]
+    fn critical_path_follows_deps_not_just_inputs() {
+        let plan = ExecutionPlan {
+            version: "0.0.0".to_owned(),
+            stages: vec![
+                Stage {
+                    nodes: vec!["a".to_owned(), "b".to_owned()],
+                },
+                Stage {
+                    nodes: vec!["c".to_owned()],
+                },
+            ],
+            nodes: BTreeMap::from([
+                ("a".to_owned(), PlannedNode {
+                    parallel: false,
+                    deps: vec![],
+                    inputs: vec![],
+                    invocations: vec![],
+                }),
+                ("b".to_owned(), PlannedNode {
+                    parallel: false,
+                    deps: vec![],
+                    inputs: vec![],
+                    invocations: vec![],
+                }),
+                ("c".to_owned(), PlannedNode {
+                    parallel: false,
+                    deps: vec!["a".to_owned(), "b".to_owned()],
+                    inputs: vec![],
+                    invocations: vec![],
+                }),
+            ]),
+        };
+        let weights = HashMap::from([("a".to_owned(), 10u128), ("b".to_owned(), 3), ("c".to_owned(), 4)]);
+        let (path, total) = critical_path(&plan, &weights).unwrap();
+        assert_eq!(path, vec!["a".to_owned(), "c".to_owned()]);
+        assert_eq!(total, 14);
+    }
+
+    #[test]
+    fn templates_have_no_lint_errors() {
+        for src in [
+            include_str!("../res/templates/min.neomake.conf"),
+            include_str!("../res/templates/max.neomake.conf"),
+            include_str!("../res/templates/python.neomake.conf"),
+        ] {
+            let findings = Compiler::new(Workflow::parse(src).unwrap()).lint().unwrap();
+            let errors: Vec<_> = findings.iter().filter(|f| f.level == LintLevel::Error).collect();
+            assert!(errors.is_empty(), "{errors:?}");
+        }
     }
 }

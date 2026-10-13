@@ -6,7 +6,10 @@ use {
         ExecEvent,
     },
     std::{
-        collections::HashMap,
+        collections::{
+            HashMap,
+            VecDeque,
+        },
         time::Instant,
     },
 };
@@ -25,7 +28,7 @@ pub struct BatchEntry {
     pub state: BatchState,
     pub duration_ms: Option<u64>,
     pub failure: Option<String>,
-    pub logs: Vec<LogLine>,
+    pub logs: VecDeque<LogLine>,
     pub current_command: Option<String>,
 }
 
@@ -100,7 +103,7 @@ impl App {
                         state: BatchState::Pending,
                         duration_ms: None,
                         failure: None,
-                        logs: Vec::new(),
+                        logs: VecDeque::new(),
                         current_command: None,
                     });
                 }
@@ -243,10 +246,10 @@ impl App {
     }
 }
 
-fn push_capped(buf: &mut Vec<LogLine>, line: LogLine) {
+fn push_capped(buf: &mut VecDeque<LogLine>, line: LogLine) {
     const CAP: usize = 5000;
     if buf.len() >= CAP {
-        buf.drain(..(buf.len() - CAP + 1));
+        buf.pop_front();
     }
-    buf.push(line);
+    buf.push_back(line);
 }

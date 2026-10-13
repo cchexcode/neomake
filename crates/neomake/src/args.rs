@@ -5,11 +5,13 @@ use {
     },
     anyhow::{
         anyhow,
+        Context,
         Result,
     },
     clap::{
         Arg,
         ArgAction,
+        ArgMatches,
     },
     std::{
         collections::{
@@ -17,7 +19,8 @@ use {
             HashSet,
         },
         io::Read,
-        iter::FromIterator,
+        num::NonZeroUsize,
+        path::PathBuf,
         str::FromStr,
     },
 };
@@ -26,6 +29,19 @@ use {
 pub enum Privilege {
     Normal,
     Experimental,
+}
+
+/// Whether the caller asked for a TUI. The tty check stays in `main`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TuiMode {
+    Auto,
+    Off,
+}
+
+impl TuiMode {
+    pub fn requested(self) -> bool {
+        matches!(self, Self::Auto)
+    }
 }
 
 #[derive(Debug)]
@@ -73,7 +89,7 @@ impl WorkflowInitTemplate {
 #[derive(Debug)]
 pub enum WorkflowInitOutput {
     Stdout,
-    File(String),
+    File(PathBuf),
 }
 
 #[derive(Debug)]
@@ -118,38 +134,38 @@ pub enum ListFormat {
 #[derive(Debug)]
 pub enum Command {
     Manual {
-        path: String,
+        path: PathBuf,
         format: ManualFormat,
     },
     Autocomplete {
-        path: String,
+        path: PathBuf,
         shell: clap_complete::Shell,
     },
     Workflow(WorkflowCommand),
     Plan {
-        workflow: String,
+        workflow: PathBuf,
         nodes: Nodes,
         args: HashMap<String, String>,
         pretty: bool,
     },
     Execute {
         plan: ExecutionPlan,
-        workers: usize,
+        workers: NonZeroUsize,
         no_stdout: bool,
         no_stderr: bool,
-        tui: crate::runner::TuiMode,
+        tui: TuiMode,
         summary: bool,
     },
     List {
-        workflow: String,
+        workflow: PathBuf,
         format: ListFormat,
     },
     Lint {
-        workflow: String,
+        workflow: PathBuf,
         json: bool,
     },
     Describe {
-        workflow: String,
+        workflow: PathBuf,
         nodes: Nodes,
         pretty: bool,
     },
@@ -158,15 +174,15 @@ pub enum Command {
         stdout_pretty: bool,
         print_stdout: bool,
         commands: Vec<String>,
-        parallelism: Option<usize>,
-        tui: crate::runner::TuiMode,
+        parallelism: Option<NonZeroUsize>,
+        tui: TuiMode,
     },
     Watch {
         filter: String,
-        root: String,
+        root: PathBuf,
         program: Vec<String>,
         commands: Vec<String>,
-        parallelism: Option<usize>,
+        parallelism: NonZeroUsize,
     },
 }
 
@@ -284,7 +300,8 @@ impl ClapArgumentLoader {
                         Arg::new("workers")
                             .short('w')
                             .long("workers")
-                            .help("Worker thread count.")
+                            .help("Maximum number of concurrent batches.")
+                            .value_parser(clap::value_parser!(NonZeroUsize))
                             .default_value("1"),
                     )
                     .arg(
@@ -374,7 +391,8 @@ impl ClapArgumentLoader {
                         Arg::new("parallelism")
                             .long("parallelism")
                             .short('p')
-                            .help("Maximum number of concurrent processes."),
+                            .help("Maximum number of concurrent processes.")
+                            .value_parser(clap::value_parser!(NonZeroUsize)),
                         Arg::new("command")
                             .short('c')
                             .long("command")
@@ -396,6 +414,7 @@ impl ClapArgumentLoader {
                         Arg::new("parallelism")
                             .short('p')
                             .long("parallelism")
+                            .value_parser(clap::value_parser!(NonZeroUsize))
                             .default_value("1"),
                         Arg::new("command").short('c').long("command").action(ArgAction::Append),
                     ]),
@@ -403,167 +422,201 @@ impl ClapArgumentLoader {
     }
 
     pub fn load() -> Result<CallArgs> {
-        let m = Self::root_command().get_matches();
-        let privileges = if m.get_flag("experimental") {
+        let matches = Self::root_command().get_matches();
+        let privileges = if matches.get_flag("experimental") {
             Privilege::Experimental
         } else {
             Privilege::Normal
         };
-
-        fn parse_nodes(x: &clap::ArgMatches) -> Nodes {
-            match x.get_many::<String>("node") {
-                | Some(v) => Nodes::Arr(HashSet::<String>::from_iter(v.map(|s| s.to_owned()))),
-                | None => Nodes::Regex(x.get_one::<String>("regex").unwrap().to_owned()),
-            }
-        }
-
-        fn parse_args_map(x: &clap::ArgMatches) -> HashMap<String, String> {
-            let mut out = HashMap::new();
-            if let Some(args) = x.get_many::<String>("arg") {
-                for a in args {
-                    let spl: Vec<&str> = a.splitn(2, '=').collect();
-                    if spl.len() == 2 {
-                        out.insert(spl[0].to_owned(), spl[1].to_owned());
-                    }
-                }
-            }
-            out
-        }
-
-        let cmd = if let Some(x) = m.subcommand_matches("man") {
-            Command::Manual {
-                path: x.get_one::<String>("out").unwrap().clone(),
-                format: match x.get_one::<String>("format").unwrap().as_str() {
-                    | "manpages" => ManualFormat::Manpages,
-                    | "markdown" => ManualFormat::Markdown,
-                    | _ => return Err(anyhow!("invalid format")),
-                },
-            }
-        } else if let Some(x) = m.subcommand_matches("autocomplete") {
-            Command::Autocomplete {
-                path: x.get_one::<String>("out").unwrap().clone(),
-                shell: clap_complete::Shell::from_str(x.get_one::<String>("shell").unwrap()).unwrap(),
-            }
-        } else if let Some(x) = m.subcommand_matches("workflow") {
-            if let Some(y) = x.subcommand_matches("init") {
-                Command::Workflow(WorkflowCommand::Init {
-                    template: match y.get_one::<String>("template").unwrap().as_str() {
-                        | "min" => WorkflowInitTemplate::Min,
-                        | "max" => WorkflowInitTemplate::Max,
-                        | "python" => WorkflowInitTemplate::Python,
-                        | _ => return Err(anyhow!("invalid template")),
-                    },
-                    output: match y.get_one::<String>("output").unwrap().as_str() {
-                        | "-" => WorkflowInitOutput::Stdout,
-                        | s => WorkflowInitOutput::File(s.to_owned()),
-                    },
-                })
-            } else if x.subcommand_matches("schema").is_some() {
-                Command::Workflow(WorkflowCommand::Schema)
-            } else {
-                return Err(anyhow!("unknown workflow subcommand"));
-            }
-        } else if let Some(x) = m.subcommand_matches("plan") {
-            Command::Plan {
-                workflow: x.get_one::<String>("workflow").unwrap().clone(),
-                nodes: parse_nodes(x),
-                args: parse_args_map(x),
-                pretty: x.get_flag("pretty"),
-            }
-        } else if let Some(x) = m.subcommand_matches("execute") {
-            let plan = match x.get_one::<String>("file") {
-                | Some(path) => std::fs::read_to_string(path)?,
-                | None => {
-                    let mut s = String::new();
-                    std::io::stdin().read_to_string(&mut s)?;
-                    s
-                },
-            };
-            Command::Execute {
-                plan: serde_json::from_str::<ExecutionPlan>(&plan)?,
-                workers: x.get_one::<String>("workers").unwrap().parse::<usize>()?,
-                no_stdout: x.get_flag("no-stdout"),
-                no_stderr: x.get_flag("no-stderr"),
-                tui: if x.get_flag("no-tui") {
-                    crate::runner::TuiMode::Off
-                } else {
-                    crate::runner::TuiMode::Auto
-                },
-                summary: x.get_flag("summary"),
-            }
-        } else if let Some(x) = m.subcommand_matches("describe") {
-            Command::Describe {
-                workflow: x.get_one::<String>("workflow").unwrap().clone(),
-                nodes: parse_nodes(x),
-                pretty: x.get_flag("pretty"),
-            }
-        } else if let Some(x) = m.subcommand_matches("list") {
-            Command::List {
-                workflow: x.get_one::<String>("workflow").unwrap().clone(),
-                format: match x.get_one::<String>("output").unwrap().as_str() {
-                    | "json" => ListFormat::Json { pretty: false },
-                    | "json+p" => ListFormat::Json { pretty: true },
-                    | "custom" => ListFormat::Custom,
-                    | _ => return Err(anyhow!("unknown list format")),
-                },
-            }
-        } else if let Some(x) = m.subcommand_matches("lint") {
-            Command::Lint {
-                workflow: x.get_one::<String>("workflow").unwrap().clone(),
-                json: x.get_one::<String>("output").map(|s| s == "json").unwrap_or(false),
-            }
-        } else if let Some(x) = m.subcommand_matches("multiplex") {
-            let commands = x
-                .get_many::<String>("command")
-                .unwrap_or_default()
-                .cloned()
-                .collect::<Vec<_>>();
-            let program = x
-                .get_one::<String>("program")
-                .unwrap()
-                .split_whitespace()
-                .map(|s| s.to_owned())
-                .collect::<Vec<_>>();
-            Command::Multiplex {
-                program,
-                stdout_pretty: x.get_flag("pretty"),
-                print_stdout: x.get_flag("stdout"),
-                commands,
-                parallelism: x.get_one::<String>("parallelism").map(|v| v.parse::<usize>().unwrap()),
-                tui: if x.get_flag("no-tui") {
-                    crate::runner::TuiMode::Off
-                } else {
-                    crate::runner::TuiMode::Auto
-                },
-            }
-        } else if let Some(x) = m.subcommand_matches("watch") {
-            let commands = x
-                .get_many::<String>("command")
-                .unwrap_or_default()
-                .cloned()
-                .collect::<Vec<_>>();
-            let program = x
-                .get_one::<String>("program")
-                .unwrap()
-                .split_whitespace()
-                .map(|s| s.to_owned())
-                .collect::<Vec<_>>();
-            Command::Watch {
-                filter: x.get_one::<String>("filter").unwrap().clone(),
-                root: x.get_one::<String>("root").unwrap().clone(),
-                program,
-                commands,
-                parallelism: x.get_one::<String>("parallelism").map(|v| v.parse::<usize>().unwrap()),
-            }
-        } else {
-            return Err(anyhow!("unknown command"));
-        };
-
-        let call = CallArgs {
-            privileges,
-            command: cmd,
-        };
+        let command = parse_command(&matches)?;
+        let call = CallArgs { privileges, command };
         call.validate()?;
         Ok(call)
     }
+}
+
+fn parse_command(matches: &ArgMatches) -> Result<Command> {
+    if let Some(sub) = matches.subcommand_matches("man") {
+        return Ok(Command::Manual {
+            path: required_path(sub, "out")?,
+            format: match required_str(sub, "format")? {
+                | "manpages" => ManualFormat::Manpages,
+                | "markdown" => ManualFormat::Markdown,
+                | other => return Err(anyhow!("invalid format `{other}`")),
+            },
+        });
+    }
+    if let Some(sub) = matches.subcommand_matches("autocomplete") {
+        let shell = required_str(sub, "shell")?;
+        return Ok(Command::Autocomplete {
+            path: required_path(sub, "out")?,
+            shell: clap_complete::Shell::from_str(shell).map_err(|_| anyhow!("invalid shell `{shell}`"))?,
+        });
+    }
+    if let Some(sub) = matches.subcommand_matches("workflow") {
+        if let Some(init) = sub.subcommand_matches("init") {
+            let template = match required_str(init, "template")? {
+                | "min" => WorkflowInitTemplate::Min,
+                | "max" => WorkflowInitTemplate::Max,
+                | "python" => WorkflowInitTemplate::Python,
+                | other => return Err(anyhow!("invalid template `{other}`")),
+            };
+            let output = match required_str(init, "output")? {
+                | "-" => WorkflowInitOutput::Stdout,
+                | path => WorkflowInitOutput::File(PathBuf::from(path)),
+            };
+            return Ok(Command::Workflow(WorkflowCommand::Init { template, output }));
+        }
+        if sub.subcommand_matches("schema").is_some() {
+            return Ok(Command::Workflow(WorkflowCommand::Schema));
+        }
+        return Err(anyhow!("unknown workflow subcommand"));
+    }
+    if let Some(sub) = matches.subcommand_matches("plan") {
+        return Ok(Command::Plan {
+            workflow: required_path(sub, "workflow")?,
+            nodes: parse_nodes(sub)?,
+            args: parse_args_map(sub)?,
+            pretty: sub.get_flag("pretty"),
+        });
+    }
+    if let Some(sub) = matches.subcommand_matches("execute") {
+        let raw = match sub.get_one::<String>("file") {
+            | Some(path) => std::fs::read_to_string(path).with_context(|| format!("failed to read plan {path}"))?,
+            | None => {
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .context("failed to read plan from stdin")?;
+                buf
+            },
+        };
+        return Ok(Command::Execute {
+            plan: serde_json::from_str::<ExecutionPlan>(&raw)
+                .context("failed to parse execution plan; re-run `neomake plan`")?,
+            workers: required_nonzero(sub, "workers")?,
+            no_stdout: sub.get_flag("no-stdout"),
+            no_stderr: sub.get_flag("no-stderr"),
+            tui: tui_mode(sub),
+            summary: sub.get_flag("summary"),
+        });
+    }
+    if let Some(sub) = matches.subcommand_matches("describe") {
+        return Ok(Command::Describe {
+            workflow: required_path(sub, "workflow")?,
+            nodes: parse_nodes(sub)?,
+            pretty: sub.get_flag("pretty"),
+        });
+    }
+    if let Some(sub) = matches.subcommand_matches("list") {
+        let format = match required_str(sub, "output")? {
+            | "json" => ListFormat::Json { pretty: false },
+            | "json+p" => ListFormat::Json { pretty: true },
+            | "custom" => ListFormat::Custom,
+            | other => return Err(anyhow!("unknown list format `{other}`")),
+        };
+        return Ok(Command::List {
+            workflow: required_path(sub, "workflow")?,
+            format,
+        });
+    }
+    if let Some(sub) = matches.subcommand_matches("lint") {
+        return Ok(Command::Lint {
+            workflow: required_path(sub, "workflow")?,
+            json: sub.get_one::<String>("output").map(|s| s == "json").unwrap_or(false),
+        });
+    }
+    if let Some(sub) = matches.subcommand_matches("multiplex") {
+        return Ok(Command::Multiplex {
+            program: parse_program(sub)?,
+            stdout_pretty: sub.get_flag("pretty"),
+            print_stdout: sub.get_flag("stdout"),
+            commands: collect_commands(sub),
+            parallelism: sub.get_one::<NonZeroUsize>("parallelism").copied(),
+            tui: tui_mode(sub),
+        });
+    }
+    if let Some(sub) = matches.subcommand_matches("watch") {
+        return Ok(Command::Watch {
+            filter: required_str(sub, "filter")?.to_owned(),
+            root: required_path(sub, "root")?,
+            program: parse_program(sub)?,
+            commands: collect_commands(sub),
+            parallelism: required_nonzero(sub, "parallelism")?,
+        });
+    }
+    Err(anyhow!("unknown command"))
+}
+
+fn required_str<'a>(matches: &'a ArgMatches, name: &str) -> Result<&'a str> {
+    matches
+        .get_one::<String>(name)
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("missing argument `{name}`"))
+}
+
+fn required_path(matches: &ArgMatches, name: &str) -> Result<PathBuf> {
+    Ok(PathBuf::from(required_str(matches, name)?))
+}
+
+fn required_nonzero(matches: &ArgMatches, name: &str) -> Result<NonZeroUsize> {
+    matches
+        .get_one::<NonZeroUsize>(name)
+        .copied()
+        .ok_or_else(|| anyhow!("missing argument `{name}`"))
+}
+
+fn tui_mode(matches: &ArgMatches) -> TuiMode {
+    if matches.get_flag("no-tui") {
+        TuiMode::Off
+    } else {
+        TuiMode::Auto
+    }
+}
+
+fn parse_nodes(matches: &ArgMatches) -> Result<Nodes> {
+    match matches.get_many::<String>("node") {
+        | Some(names) => Ok(Nodes::Arr(names.cloned().collect())),
+        | None => {
+            let regex = required_str(matches, "regex")?;
+            fancy_regex::Regex::new(regex).map_err(|err| anyhow!("invalid node regex `{regex}`: {err}"))?;
+            Ok(Nodes::Regex(regex.to_owned()))
+        },
+    }
+}
+
+fn parse_args_map(matches: &ArgMatches) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    let Some(args) = matches.get_many::<String>("arg") else {
+        return Ok(out);
+    };
+    for arg in args {
+        let Some((key, value)) = arg.split_once('=') else {
+            return Err(anyhow!("arg `{arg}` must be key=value"));
+        };
+        if key.is_empty() || key.split('.').any(|part| part.is_empty()) {
+            return Err(anyhow!("arg key `{key}` is empty or has an empty segment"));
+        }
+        if out.insert(key.to_owned(), value.to_owned()).is_some() {
+            return Err(anyhow!("duplicate arg key `{key}`"));
+        }
+    }
+    Ok(out)
+}
+
+fn collect_commands(matches: &ArgMatches) -> Vec<String> {
+    matches
+        .get_many::<String>("command")
+        .unwrap_or_default()
+        .cloned()
+        .collect()
+}
+
+fn parse_program(matches: &ArgMatches) -> Result<Vec<String>> {
+    let raw = required_str(matches, "program")?;
+    let program: Vec<String> = raw.split_whitespace().map(str::to_owned).collect();
+    if program.is_empty() {
+        return Err(anyhow!("--program must include an executable"));
+    }
+    Ok(program)
 }

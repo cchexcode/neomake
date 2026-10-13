@@ -2,9 +2,9 @@ pub mod app;
 pub mod ui;
 
 use {
-    crate::exec::{
-        Cancel,
-        ExecEvent,
+    crate::{
+        cancel::Cancel,
+        exec::ExecEvent,
     },
     anyhow::Result,
     crossterm::{

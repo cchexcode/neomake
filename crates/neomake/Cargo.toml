@@ -27,13 +27,9 @@ clap-markdown = { workspace = true }
 schemars = { workspace = true }
 handlebars = { workspace = true }
 itertools = { workspace = true }
-threadpool = { workspace = true }
 fancy-regex = { workspace = true }
 notify = { workspace = true }
 signal-hook = { workspace = true }
-flume = { workspace = true }
-parking_lot = { workspace = true }
-walkdir = { workspace = true }
 crossterm = { workspace = true }
 ratatui = { workspace = true }
 futures = { workspace = true }

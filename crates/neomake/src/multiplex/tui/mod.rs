@@ -2,9 +2,9 @@ pub mod app;
 pub mod ui;
 
 use {
-    crate::multiplex::{
-        Cancel,
-        MuxEvent,
+    crate::{
+        cancel::Cancel,
+        multiplex::MuxEvent,
     },
     anyhow::Result,
     crossterm::{

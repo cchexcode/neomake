@@ -16,32 +16,27 @@ bounded worker pool.
 ```
 crates/neomake/src/
   main.rs         Entry point + async tokio runtime. Dispatches clap subcommands.
-  args.rs         CLI argument parsing (clap builder). Defines the Command enum + Privilege
-                  check (experimental features gating: multiplex, watch).
+  args.rs         CLI parsing (clap builder) into the `Command` enum. Privilege check gates
+                  experimental commands. Does not compile or execute.
+  cancel.rs       Shared cooperative `Cancel`. `trip` wakes every waiter; no poll loop.
   reference.rs    Manpages (clap_mangen), markdown docs (clap-markdown), shell completions
                   (clap_complete). Drives `man` and `autocomplete` subcommands.
-  workflow.rs    Workflow model + HOCON loader. Structs Workflow / Env / Node / Matrix /
-                  MatrixCell / Task / NodeSelector. `Workflow::load()` parses HOCON, validates
-                  the version and node-name regex, then deserializes via hocon's serde support.
-  plan.rs         ExecutionPlan / Stage / Node / Invocation / Task data types + the Compiler
-                  that turns a Workflow into a plan. Compiler does handlebars rendering of task
-                  scripts, matrix cartesian-product expansion, and DAG topological grouping
-                  into waves (stages). Also implements `list` and `describe` outputs.
-  exec.rs         DAG execution engine. Async tokio-based: each wave spawns its batches
-                  onto a `JoinSet` bounded by a `Semaphore` (sized by `--workers`). Child
-                  processes are `tokio::process::Command` with piped stdout/stderr read
-                  line-by-line and emitted as `ExecEvent`s on an mpsc channel. Matrix
-                  `parallel=true` spawns one batch per invocation; `parallel=false` glues
-                  invocations into a single sequential batch. Supports cooperative cancel
-                  via `Cancel` (tripped on user `q` / Ctrl+C). Each `Work` carries an
-                  optional `ResolvedContainer`; when present, `run_one` branches through
-                  `build_container_command` to spawn `<docker|podman> run --rm -i …` using
-                  a shared `RuntimeResolver` (cached on the engine).
-  runner.rs       Execution driver selection. `execute()` starts the engine task, then picks
-                  between the TUI driver (`tui/`) and the plain streaming driver based on
-                  TTY detection and the `--no-tui` flag. Plain driver forwards captured
-                  stdout/stderr with a `[node]` prefix and prints per-batch / per-wave
-                  summaries; the TUI driver shows the structured live view.
+  workflow.rs     HOCON source model only: Workflow / Env / Node / Matrix / Task /
+                  NodeSelector / container config. Does not import `plan`. `load` validates
+                  version and node names. `Env::compile` takes an injected host map — it does
+                  not read `std::env`. Matrix expansion returns workflow cells, not plan types.
+  plan.rs         Resolved plan types (`PlannedNode`, `PlannedInvocation`, `PlannedTask`) and
+                  `Compiler`. Turns a workflow plus a host env map into a fully resolved plan:
+                  handlebars, matrix expansion, container merge, env merge, DAG waves. `list`,
+                  `describe`, and `lint` return data; `main` prints. `when` script guards are
+                  the only plan-time process spawn.
+  exec.rs         Runs a resolved plan. Does not merge config. Waves are sequential; batches
+                  in a wave share a `Semaphore` of size `--workers`. Stdout is streamed
+                  line-by-line and retained for `inputs`. Container identity (cwd, uid, gid)
+                  is captured once in `ExecEngine::new`.
+  runner.rs       Wires the engine to the TUI or plain driver. `main` decides the tty; this
+                  module receives a bool. Prints `--summary`, including a critical path over
+                  the plan's `deps`.
   tui/mod.rs      Terminal setup (alternate screen on stderr, raw mode) and the async event
                   loop driving the execution TUI. `EventStream` for keyboard input; works
                   with piped stdin because crossterm's `use-dev-tty` backend reads keys from
@@ -74,19 +69,22 @@ crates/neomake/res/templates/
 2. **Plan & Execute separation** — `plan` compiles a workflow (resolving env, handlebars
    args, and matrix expansion) into a fully-rendered JSON plan. `execute` reads a plan from
    stdin and runs it. Plans are reviewable, storable, and reproducible.
-3. **DAG waves, bounded parallelism** — `pre` edges form a DAG; `determine_order` groups
-   nodes into waves (stages). Waves run sequentially; within a wave, a `threadpool::ThreadPool`
-   with `--workers` workers bounds concurrency. Errors in a wave abort before the next wave.
+3. **DAG waves, bounded parallelism** — `pre` and `inputs` edges form a DAG. The compiler
+   groups nodes into waves. Waves run sequentially; within a wave a tokio `Semaphore` of
+   size `--workers` bounds concurrency. A failing wave aborts the rest of the plan. Wave
+   membership is sorted so plan JSON is reproducible.
 4. **Matrix parallelism toggle** — Each node's matrix has `parallel: bool`. `true` means each
    invocation (cartesian cell) is an independent work item submitted to the pool. `false` means
    all tasks for all invocations are serialized into one pool job.
-5. **Layered env resolution** — Env vars are merged in this precedence (later overrides earlier):
+5. **Layered env resolution** — Env vars are merged at plan time, later overrides earlier:
    `workflow.env → node.env → matrix-cell.env (per invocation) → task.env`. Each level supports
-   explicit `vars` and/or a `capture` regex that imports matching host env vars at plan time.
+   explicit `vars` and/or a `capture` regex. `main` snapshots `std::env` once and passes it in.
+   The merged map is stored on each planned task. Execute does not merge again.
 6. **Command multiplexing (experimental)** — `multiplex` runs N shell commands concurrently with
    a `-p/--parallelism` cap, optionally emitting an aggregated JSON result on stdout. The
    multiplexer is **native** to neomake (no external crate): tokio `JoinSet` for parallelism,
-   tokio `Semaphore` as budget, `flume` for task events, `crossterm` for the live status view.
+   tokio `Semaphore` as budget, an mpsc channel for task events, `crossterm` for the live view.
+   A failed or cancelled run exits non-zero.
 7. **Watch (experimental)** — `watch` combines `notify` with the multiplexer: filesystem events
    matching a user regex (`<kind>|<relative-path>`) re-run the configured command set.
 8. **Handlebars in scripts** — Task scripts may reference `{{ foo.bar }}`; `plan -a foo.bar=value`
@@ -102,7 +100,7 @@ crates/neomake/res/templates/
     jarring). If event-reader init still fails (e.g. `/dev/tty` unreachable in unusual
     hosts / containers), the runner prints a one-line notice to stderr and falls through to
     plain with no loss of engine output.
-10. **Exact node-name discipline** — Node names must match `^[a-zA-Z0-9:_-]+$`. `pre` selectors
+11. **Exact node-name discipline** — Node names must match `^[a-zA-Z0-9:_-]+$`. `pre` selectors
     are either exact names (`{ name = "x" }`) or regex (`{ regex = "^build:.*$" }`), deserialized
     as a `#[serde(untagged)]` enum so HOCON `{ name = "a" }` maps cleanly.
 
@@ -180,11 +178,10 @@ task).
 `podman { extra_args }`). Only the sub-block matching the resolved runtime is applied.
 `extra_args` is **additive** across merge levels, preserving order.
 
-**Task-level merge quirk**: a plan `Task::container` is only populated when the task
-itself declared a `container` block — otherwise it's left `None` so at execute time the
-engine falls through to `Invocation::container` (which already captured
-workflow+node+cell merges). This preserves the expected "cell-level override wins for a
-plain task, but task-level override beats the cell" semantics.
+The compiler merges `workflow → node → cell → task` once per invocation and stores a
+`ResolvedContainer` on each planned task. Execute does not merge. A task that declares any
+container field still inherits unset fields from the cell; it does not discard the cell.
+`disabled = true` at the winning scope forces a host execution.
 
 **Spawn shape** (in `exec.rs::build_container_command`):
 ```
@@ -269,19 +266,18 @@ Each top-level `crates/neomake/src/*.rs` file has a single responsibility. No lo
 modules. When a domain grows big enough to need multiple files, promote it to a subdirectory
 with `mod.rs` (mirroring `qb`'s `k8s/` and `tui/` pattern). Until then, prefer flat files.
 
-- `workflow.rs` — HOCON parsing + validation + types. No I/O beyond reading the file. No
-  execution concerns.
-- `plan.rs` — Pure transformation: `Workflow → ExecutionPlan`. Handlebars rendering and DAG
-  ordering live here. No process spawning.
-- `exec.rs` — Async subprocess orchestration via `tokio::process`. Pure consumer of
-  `ExecutionPlan`; streams `ExecEvent`s on an mpsc channel so observation (TUI, plain
-  driver) is decoupled from spawning.
-- `runner.rs` — Selects the execution driver (TUI vs plain) and wires the engine to it.
-- `tui/` — Semi-interactive TUI driver over the engine's event stream.
-- `multiplex.rs` — Holds both `multiplex` and `watch` since they share the same multiplexer
-  backend.
+- `workflow.rs` — HOCON source types and validation. No plan types, no process env, no spawning.
+- `plan.rs` — `Workflow` + injected host env → resolved `ExecutionPlan`. Prints nothing.
+  `when` script guards are the only spawn, and they are plan-time by contract.
+- `exec.rs` — Consumes a resolved plan. Does not re-merge env, shell, retry, or container.
+- `runner.rs` — Driver selection and summary rendering. Does not compile.
+- `tui/` — Execute TUI. Does not spawn.
+- `multiplex/` — Multiplexer and watch. Does not import the plan or the runner.
+- `cancel.rs` — Shared cancellation. Both engines use it.
 - `reference.rs` — Output-only (docs + completions).
-- `args.rs` — Input-only (clap definitions + parsing into the `Command` enum).
+- `args.rs` — Input-only. Paths are `PathBuf`, worker counts are `NonZeroUsize`.
+- Dependency direction is acyclic: `args`/`main` → `plan` → `workflow`; `exec` → `plan`;
+  `runner` → `exec` + `tui`; `multiplex` does not depend on `runner`.
 
 ### Enum-driven dispatch
 
@@ -299,15 +295,20 @@ matches on it without a catch-all arm. Adding a subcommand means:
 - **HOCON enum quirk**: HOCON's serde adapter mishandles externally-tagged enums. Use
   `#[serde(untagged)]` with struct-variant field names matching the HOCON keys (see
   `NodeSelector`). Do **not** use tuple-variants with external tagging for HOCON-parsed types.
-- **Env precedence**: Always merge in the order global → node → invocation → task. This is
-  hardcoded in `exec.rs`; keep it consistent with anyone reading workflow files.
-- **Matrix cell coordinates**: `Invocation::cell` records the per-dimension index of the cell
-  that produced it — included in plan output for debuggability; not required at runtime.
-- **Cycle detection**: `determine_order` errors with "cycle detected in DAG" when no new leaves
-  can be extracted. This also catches unreferenced transitive-only deps because unknown node
-  names fail earlier with "node not found".
-- **Error aggregation**: `ExecutionEngine::execute` collects all worker errors in a wave and
-  returns them joined by `\n`, so the user sees every failing command.
+- **Env precedence**: Merge in `Compiler` as workflow → node → cell → task. Do not merge again
+  in `exec`. Capture reads the host map passed from `main`, never `std::env` below that boundary.
+- **Plan is the resolved form**: `PlannedTask` carries shell, env, retry, and container. Do not
+  add a second source of truth on the node that execute must consult.
+- **Matrix cell coordinates**: `PlannedInvocation::cell` is `Vec<u32>` (it does not wrap at 255).
+  Empty string is the inputs-JSON key for a non-matrix producer.
+- **Workflow version**: `"0.0"` matches any CLI. Any other value must equal the CLI major.minor.
+  A plan's `version` must equal `CARGO_PKG_VERSION` or execute refuses it.
+- **Cycle detection**: `Compiler::order` errors with the stuck node names when no new leaves can
+  be extracted. Unknown node names fail earlier with "node not found".
+- **HOCON fields**: the `hocon` crate drops a field it cannot parse and keeps going, which
+  surfaces as `missing field`. Put one field per line. Do not write `a { x = 1 y = 2 }`.
+- **Requested `when`**: a directly selected node whose guard is falsy is a plan error. A `pre`
+  on a skipped node is omitted; an `inputs` on a skipped node is an error.
 
 ### Style
 
@@ -330,8 +331,7 @@ matches on it without a catch-all arm. Adding a subcommand means:
 - **handlebars** (strict mode) — Task script templating.
 - **clap** (builder style) + **clap_complete** + **clap_mangen** + **clap-markdown** —
   CLI parsing and documentation generation.
-- **tokio** (multi-thread) — async runtime for `multiplex` and `watch`.
-- **threadpool** — Synchronous worker pool for `execute` (one pool per wave).
+- **tokio** (multi-thread) — async runtime for execute, multiplex, and watch.
 - **fancy-regex** — Workflow node selectors and watch filters.
 - **notify** + **signal-hook** — Filesystem watch and signal handling (`watch` subcommand).
 - **ratatui** + **crossterm** (event-stream feature) + **futures** — Execution and multiplex

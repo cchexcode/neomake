@@ -1,9 +1,11 @@
 pub mod tui;
 
 use {
-    crate::runner::TuiMode,
+    crate::cancel::Cancel,
     anyhow::{
         anyhow,
+        bail,
+        Context,
         Result,
     },
     jiff::Timestamp,
@@ -13,18 +15,12 @@ use {
     },
     std::{
         collections::BTreeMap,
-        io::{
-            IsTerminal,
-            Write,
+        io::Write,
+        path::{
+            Path,
+            PathBuf,
         },
-        path::Path,
-        sync::{
-            atomic::{
-                AtomicBool,
-                Ordering,
-            },
-            Arc,
-        },
+        sync::Arc,
         time::Instant,
     },
     tokio::{
@@ -86,29 +82,13 @@ pub enum MuxEvent {
     },
 }
 
-/// Cooperative cancellation flag shared with the engine.
-#[derive(Clone, Default)]
-pub struct Cancel(Arc<AtomicBool>);
-
-impl Cancel {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn trip(&self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-
-    pub fn tripped(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
-    }
-}
-
 /// Aggregated result emitted when `--stdout` is given.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct MultiplexerResult {
     pub metadata: MultiplexerResultMetadata,
+    pub failed: usize,
+    pub aborted: bool,
     pub tasks: BTreeMap<usize, MultiplexerResultDataTask>,
 }
 
@@ -177,9 +157,6 @@ impl Multiplexer {
         let mut joins = JoinSet::<(usize, bool, String)>::new();
 
         for info in &tasks {
-            if self.cancel.tripped() {
-                break;
-            }
             let id = info.id;
             let command_str = info.command.clone();
             let program = self.program.clone();
@@ -188,19 +165,16 @@ impl Multiplexer {
             let budget = budget.clone();
 
             joins.spawn(async move {
-                let _permit = match budget.acquire_owned().await {
-                    | Ok(p) => p,
-                    | Err(_) => return (id, false, String::new()),
+                let permit = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        emit_cancelled(&tx, id);
+                        return (id, false, String::new());
+                    }
+                    acquired = budget.acquire_owned() => acquired,
                 };
-                if cancel.tripped() {
-                    let _ = tx.send(MuxEvent::TaskCompleted {
-                        id,
-                        status: TaskStatus::Failed {
-                            code: None,
-                            message: "cancelled".to_owned(),
-                        },
-                        duration_ms: 0,
-                    });
+                if permit.is_err() || cancel.tripped() {
+                    emit_cancelled(&tx, id);
                     return (id, false, String::new());
                 }
                 run_task(id, program, command_str, tx, cancel).await
@@ -227,8 +201,11 @@ impl Multiplexer {
         });
 
         let ended = Timestamp::now();
+        let aborted = self.cancel.tripped();
         let mut data = MultiplexerResult {
             metadata: MultiplexerResultMetadata { started, ended },
+            failed,
+            aborted,
             tasks: BTreeMap::new(),
         };
         for info in tasks {
@@ -302,7 +279,7 @@ async fn run_task(
 
     let status = tokio::select! {
         s = child.wait() => s,
-        _ = wait_cancel(&cancel) => {
+        _ = cancel.cancelled() => {
             let _ = child.kill().await;
             let _ = child.wait().await;
             Err(std::io::Error::other("cancelled"))
@@ -339,27 +316,29 @@ async fn run_task(
     (id, ok, stdout_collected)
 }
 
-async fn wait_cancel(cancel: &Cancel) {
-    loop {
-        if cancel.tripped() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+fn emit_cancelled(tx: &UnboundedSender<MuxEvent>, id: usize) {
+    let _ = tx.send(MuxEvent::TaskCompleted {
+        id,
+        status: TaskStatus::Failed {
+            code: None,
+            message: "cancelled".to_owned(),
+        },
+        duration_ms: 0,
+    });
 }
 
 /// Entry point used by `main.rs` for `neomake multiplex`.
 ///
-/// Auto-selects the driver: the TUI when both stdin and stderr are TTYs and
-/// `--no-tui` is not set, otherwise the plain streaming driver. In both paths,
-/// `print_stdout` triggers the JSON aggregate on stdout at the end.
+/// `tui` is the caller's choice after the tty check. `print_stdout` emits the
+/// JSON aggregate after the driver finishes. A failed or cancelled run is an
+/// error.
 pub async fn run(
     program: Vec<String>,
     commands: Vec<String>,
     parallelism: Option<usize>,
     print_stdout: bool,
     stdout_pretty: bool,
-    tui_mode: TuiMode,
+    tui: bool,
 ) -> Result<()> {
     let parallelism = parallelism.unwrap_or_else(|| commands.len().max(1));
     let cancel = Cancel::new();
@@ -367,9 +346,7 @@ pub async fn run(
     let mux = Multiplexer::new(program, commands, parallelism).with_cancel(cancel.clone());
     let engine_handle = tokio::spawn(async move { mux.run(tx).await });
 
-    let use_tui = matches!(tui_mode, TuiMode::Auto) && std::io::stderr().is_terminal();
-
-    if use_tui {
+    if tui {
         if let Err(e) = tui::probe_event_reader() {
             eprintln!("TUI disabled ({}); using plain driver.", e);
             run_plain(rx).await?;
@@ -390,6 +367,12 @@ pub async fn run(
         } else {
             println!("{}", serde_json::to_string(&result)?);
         }
+    }
+    if result.aborted {
+        bail!("multiplex aborted");
+    }
+    if result.failed > 0 {
+        bail!("{} task(s) failed", result.failed);
     }
     Ok(())
 }
@@ -462,10 +445,10 @@ fn short_cmd(s: &str) -> String {
 /// too jarring.
 pub async fn watch(
     filter: String,
-    root: String,
+    root: PathBuf,
     program: Vec<String>,
     commands: Vec<String>,
-    parallelism: Option<usize>,
+    parallelism: usize,
 ) -> Result<()> {
     use signal_hook::{
         consts::{
@@ -475,18 +458,27 @@ pub async fn watch(
         iterator::Signals,
     };
 
-    let regex = fancy_regex::Regex::new(&filter)?;
-    let trim_path = std::fs::canonicalize(&root)?.to_string_lossy().into_owned() + std::path::MAIN_SEPARATOR_STR;
+    let regex = fancy_regex::Regex::new(&filter).with_context(|| format!("invalid watch filter `{filter}`"))?;
+    let canon = std::fs::canonicalize(&root).with_context(|| format!("watch root not found: {}", root.display()))?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let pll = parallelism.unwrap_or(1);
+    let pll = parallelism.max(1);
     tokio::spawn(async move {
         while rx.recv().await.is_some() {
             let (ev_tx, ev_rx) = unbounded_channel::<MuxEvent>();
             let mux = Multiplexer::new(program.clone(), commands.clone(), pll);
-            let h = tokio::spawn(async move { mux.run(ev_tx).await });
-            let _ = run_plain(ev_rx).await;
-            let _ = h.await;
+            let handle = tokio::spawn(async move { mux.run(ev_tx).await });
+            if let Err(err) = run_plain(ev_rx).await {
+                eprintln!("watch run failed: {err:#}");
+            }
+            match handle.await {
+                | Ok(Ok(result)) if result.failed > 0 || result.aborted => {
+                    eprintln!("watch run: {} task(s) failed", result.failed);
+                },
+                | Ok(Err(err)) => eprintln!("watch run failed: {err:#}"),
+                | Err(err) => eprintln!("watch run panicked: {err}"),
+                | Ok(Ok(_)) => {},
+            }
         }
     });
 
@@ -496,9 +488,8 @@ pub async fn watch(
                 | Ok(e) => {
                     let kind = format_event_kind(&e.kind);
                     if let Some(path) = e.paths.first() {
-                        let p = path.to_string_lossy();
-                        let rel = p.trim_start_matches(&trim_path);
-                        let line = format!("{}|{}", kind, rel);
+                        let rel = path.strip_prefix(&canon).unwrap_or(path);
+                        let line = format!("{kind}|{}", rel.display());
                         if regex.is_match(&line).unwrap_or(false) {
                             let _ = tx.send(line);
                         }
@@ -510,7 +501,14 @@ pub async fn watch(
         notify::Config::default(),
     )?;
     watcher.watch(Path::new(&root), notify::RecursiveMode::Recursive)?;
-    Signals::new([SIGINT, SIGTERM])?.wait();
+    // signal-hook's wait blocks. Keep it off the runtime so the watcher callback
+    // and the command task can still be polled.
+    let mut signals = Signals::new([SIGINT, SIGTERM]).context("failed to install signal handlers")?;
+    tokio::task::spawn_blocking(move || {
+        let _ = signals.forever().next();
+    })
+    .await
+    .context("signal wait failed")?;
     Ok(())
 }
 

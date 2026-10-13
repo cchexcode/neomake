@@ -1,10 +1,9 @@
 use {
     crate::{
+        cancel::Cancel,
         exec::{
-            BatchInfo,
             BatchKey,
             BatchStatus,
-            Cancel,
             ExecEngine,
             ExecEvent,
         },
@@ -12,24 +11,15 @@ use {
     },
     anyhow::{
         anyhow,
+        Context,
         Result,
     },
     std::{
         collections::HashMap,
-        io::IsTerminal,
         time::Instant,
     },
     tokio::sync::mpsc::unbounded_channel,
 };
-
-/// How output should be presented to the user.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum TuiMode {
-    /// TUI when stderr is a TTY, plain otherwise.
-    Auto,
-    /// Force the plain streaming driver.
-    Off,
-}
 
 /// Whether children's stdout/stderr are forwarded in plain mode.
 #[derive(Debug, Clone, Copy)]
@@ -43,14 +33,14 @@ pub struct PlainOutput {
 /// Decides between the TUI and the plain streaming driver, spawns the engine,
 /// collects timing events for the optional `--summary`, and wires events
 /// between the two. Returns `Err` when any batch failed or the user cancelled.
-pub async fn execute(
-    plan: ExecutionPlan,
-    workers: usize,
-    tui: TuiMode,
-    plain: PlainOutput,
-    summary: bool,
-) -> Result<()> {
-    let use_tui = matches!(tui, TuiMode::Auto) && std::io::stderr().is_terminal();
+pub async fn execute(plan: ExecutionPlan, workers: usize, tui: bool, plain: PlainOutput, summary: bool) -> Result<()> {
+    if plan.version != env!("CARGO_PKG_VERSION") {
+        anyhow::bail!(
+            "execution plan version {} does not match neomake {}; re-run `neomake plan`",
+            plan.version,
+            env!("CARGO_PKG_VERSION")
+        );
+    }
 
     let cancel = Cancel::new();
     let (tx, rx) = unbounded_channel::<ExecEvent>();
@@ -66,13 +56,13 @@ pub async fn execute(
         (rx, None)
     };
 
-    let engine = ExecEngine::new(workers).with_cancel(cancel.clone());
+    let engine = ExecEngine::new(workers)?.with_cancel(cancel.clone());
     let plan_for_engine = plan.clone();
     let engine_handle = tokio::spawn(async move { engine.run(&plan_for_engine, tx).await });
 
     let summary_handle = rx_summary.map(|r| tokio::spawn(collect_summary(r)));
 
-    let result = if use_tui {
+    let result = if tui {
         if let Err(e) = crate::tui::probe_event_reader() {
             eprintln!("TUI disabled ({}); using plain driver.", e);
             run_plain(rx_driver, plain).await
@@ -83,18 +73,18 @@ pub async fn execute(
         run_plain(rx_driver, plain).await
     };
 
-    let _ = engine_handle.await;
-
-    if let Some(h) = summary_handle {
-        if let Ok(data) = h.await {
+    if let Some(handle) = summary_handle {
+        if let Ok(data) = handle.await {
             print_summary(&plan, &data);
         }
     }
 
-    match result {
-        | Ok(true) => Ok(()),
-        | Ok(false) => Err(anyhow!("execution failed")),
-        | Err(e) => Err(e),
+    let driver_ok = result?;
+    let engine_ok = engine_handle.await.context("execution engine panicked")??;
+    if driver_ok && engine_ok {
+        Ok(())
+    } else {
+        Err(anyhow!("execution failed"))
     }
 }
 
@@ -106,64 +96,8 @@ async fn tee(
     b: tokio::sync::mpsc::UnboundedSender<ExecEvent>,
 ) {
     while let Some(ev) = rx.recv().await {
-        let cloned = clone_event(&ev);
+        let _ = b.send(ev.clone());
         let _ = a.send(ev);
-        let _ = b.send(cloned);
-    }
-}
-
-fn clone_event(ev: &ExecEvent) -> ExecEvent {
-    match ev {
-        | ExecEvent::Started { batches } => {
-            ExecEvent::Started {
-                batches: batches.clone(),
-            }
-        },
-        | ExecEvent::WaveStarted { wave } => ExecEvent::WaveStarted { wave: *wave },
-        | ExecEvent::BatchStarted { key, command } => {
-            ExecEvent::BatchStarted {
-                key: key.clone(),
-                command: command.clone(),
-            }
-        },
-        | ExecEvent::Stdout { key, line } => {
-            ExecEvent::Stdout {
-                key: key.clone(),
-                line: line.clone(),
-            }
-        },
-        | ExecEvent::Stderr { key, line } => {
-            ExecEvent::Stderr {
-                key: key.clone(),
-                line: line.clone(),
-            }
-        },
-        | ExecEvent::BatchCompleted {
-            key,
-            status,
-            duration_ms,
-        } => {
-            ExecEvent::BatchCompleted {
-                key: key.clone(),
-                status: status.clone(),
-                duration_ms: *duration_ms,
-            }
-        },
-        | ExecEvent::WaveCompleted { wave, failures } => {
-            ExecEvent::WaveCompleted {
-                wave: *wave,
-                failures: *failures,
-            }
-        },
-        | ExecEvent::Finished {
-            failed_batches,
-            aborted,
-        } => {
-            ExecEvent::Finished {
-                failed_batches: *failed_batches,
-                aborted: *aborted,
-            }
-        },
     }
 }
 
@@ -178,7 +112,7 @@ async fn run_plain(mut rx: tokio::sync::mpsc::UnboundedReceiver<ExecEvent>, outp
         match ev {
             | ExecEvent::Started { batches } => {
                 for info in &batches {
-                    labels.insert(info.key.clone(), prefix_label(info));
+                    labels.insert(info.key.clone(), info.key.label(info));
                 }
             },
             | ExecEvent::WaveStarted { wave } => {
@@ -246,24 +180,7 @@ async fn run_plain(mut rx: tokio::sync::mpsc::UnboundedReceiver<ExecEvent>, outp
     Ok(ok)
 }
 
-fn prefix_label(info: &BatchInfo) -> String {
-    let cells = info
-        .invocations
-        .iter()
-        .filter(|c| !c.is_empty())
-        .map(|c| c.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","))
-        .collect::<Vec<_>>();
-    if cells.is_empty() {
-        info.key.node.clone()
-    } else if cells.len() == 1 {
-        format!("{}[{}]", info.key.node, cells[0])
-    } else {
-        format!("{}[×{}]", info.key.node, cells.len())
-    }
-}
-
-// ---- Summary collection & rendering
-// ---------------------------------------------------
+// Summary collection and rendering.
 
 struct SummaryData {
     started_at: Instant,
@@ -273,7 +190,6 @@ struct SummaryData {
     wave_starts: HashMap<usize, Instant>,
     wave_ends: HashMap<usize, Instant>,
     labels: HashMap<BatchKey, String>,
-    failed_batches: usize,
     aborted: bool,
 }
 
@@ -292,7 +208,6 @@ async fn collect_summary(mut rx: tokio::sync::mpsc::UnboundedReceiver<ExecEvent>
         wave_starts: HashMap::new(),
         wave_ends: HashMap::new(),
         labels: HashMap::new(),
-        failed_batches: 0,
         aborted: false,
     };
     while let Some(ev) = rx.recv().await {
@@ -301,7 +216,7 @@ async fn collect_summary(mut rx: tokio::sync::mpsc::UnboundedReceiver<ExecEvent>
                 data.started_at = Instant::now();
                 data.total_batches = batches.len();
                 for info in &batches {
-                    data.labels.insert(info.key.clone(), prefix_label(info));
+                    data.labels.insert(info.key.clone(), info.key.label(info));
                 }
             },
             | ExecEvent::WaveStarted { wave } => {
@@ -322,12 +237,8 @@ async fn collect_summary(mut rx: tokio::sync::mpsc::UnboundedReceiver<ExecEvent>
             | ExecEvent::WaveCompleted { wave, .. } => {
                 data.wave_ends.insert(wave, Instant::now());
             },
-            | ExecEvent::Finished {
-                failed_batches,
-                aborted,
-            } => {
+            | ExecEvent::Finished { aborted, .. } => {
                 data.finished_at = Some(Instant::now());
-                data.failed_batches = failed_batches;
                 data.aborted = aborted;
             },
             | _ => {},
@@ -382,84 +293,17 @@ fn print_summary(plan: &ExecutionPlan, data: &SummaryData) {
         }
     }
 
-    // Critical path: longest chain through the plan's DAG weighted by observed
-    // durations. For matrix nodes, use the max invocation duration across all
-    // cells as the node's weight.
-    if let Some((path, path_ms)) = critical_path(plan, data) {
-        let _ = writeln!(w, "critical path ({} ms):", path_ms);
-        for n in &path {
-            let per_node_ms = data
-                .batches
-                .iter()
-                .filter(|(k, _)| &k.node == n)
-                .map(|(_, b)| b.duration_ms)
-                .max()
-                .unwrap_or(0);
-            let _ = writeln!(w, "  → {} ({} ms)", n, per_node_ms);
+    let mut weights = HashMap::<String, u128>::new();
+    for (key, batch) in &data.batches {
+        let entry = weights.entry(key.node.clone()).or_insert(0);
+        *entry = (*entry).max(u128::from(batch.duration_ms));
+    }
+    if let Some((path, path_ms)) = crate::plan::critical_path(plan, &weights) {
+        let _ = writeln!(w, "critical path ({path_ms} ms):");
+        for name in &path {
+            let ms = weights.get(name).copied().unwrap_or(0);
+            let _ = writeln!(w, "  → {name} ({ms} ms)");
         }
     }
     let _ = writeln!(w, "───────────────────────────────────────────");
-}
-
-/// Longest chain through the DAG weighted by per-node duration (max over matrix
-/// cells). Uses the plan's stage structure to derive edges: a node depends on
-/// every node that appears in an earlier wave AND is one of its declared
-/// `inputs` or matches a `pre` — but we don't have the workflow here, so
-/// approximate via the plan's `inputs` field plus topological position.
-fn critical_path(plan: &ExecutionPlan, data: &SummaryData) -> Option<(Vec<String>, u128)> {
-    let mut weight = HashMap::<String, u128>::new();
-    let mut order = Vec::<String>::new();
-    for stage in &plan.stages {
-        for n in &stage.nodes {
-            order.push(n.clone());
-            let w = data
-                .batches
-                .iter()
-                .filter(|(k, _)| &k.node == n)
-                .map(|(_, b)| b.duration_ms as u128)
-                .max()
-                .unwrap_or(0);
-            weight.insert(n.clone(), w);
-        }
-    }
-
-    // Parents from `inputs` only — `pre` is ordering, not data flow, and we don't
-    // have the original workflow here. This still produces a correct critical
-    // path through the nodes whose data actually chained together.
-    let mut best = HashMap::<String, (u128, Option<String>)>::new();
-    for n in &order {
-        let node = match plan.nodes.get(n) {
-            | Some(x) => x,
-            | None => continue,
-        };
-        let w = *weight.get(n).unwrap_or(&0);
-        let mut this_best = (w, None);
-        for parent in &node.inputs {
-            if let Some((p_time, _)) = best.get(parent) {
-                let candidate = *p_time + w;
-                if candidate > this_best.0 {
-                    this_best = (candidate, Some(parent.clone()));
-                }
-            }
-        }
-        best.insert(n.clone(), this_best);
-    }
-
-    let (end_node, end_total) = best
-        .iter()
-        .max_by_key(|(_, (t, _))| *t)
-        .map(|(n, (t, _))| (n.clone(), *t))?;
-    if end_total == 0 {
-        return None;
-    }
-
-    // Walk backwards.
-    let mut path = Vec::<String>::new();
-    let mut cur = Some(end_node);
-    while let Some(n) = cur {
-        path.push(n.clone());
-        cur = best.get(&n).and_then(|(_, p)| p.clone());
-    }
-    path.reverse();
-    Some((path, end_total))
 }

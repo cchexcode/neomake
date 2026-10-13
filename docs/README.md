@@ -51,7 +51,7 @@ Released and actively maintained.
 - **Container encapsulation.** Declare `container { image = "alpine" }` at workflow,
   node, matrix-cell, or task scope (innermost-wins merge) to route those tasks through
   `docker run` / `podman run` with the host CWD bind-mounted. Pick the runtime
-  explicitly with `runtime = "docker"` or `"podman"` (default `docker`, no autoselect).
+  explicitly with `runtime { docker { … } }` or `runtime { podman { … } }` (default docker, no autoselect).
   No CLI flags — everything lives in the workflow file.
 - **Native command multiplexing.** `neomake multiplex` runs N shell commands concurrently
   with a bounded parallelism budget. When run from a terminal it shows a ratatui-based TUI
@@ -165,7 +165,7 @@ Node names must match `^[a-zA-Z0-9:_-]+$`. `pre` entries are either
 | `workflow init -t TEMPLATE -o FILE`     |                  | Write a starter workflow (`min`, `max`, `python`). `-o -` = stdout. |
 | `workflow schema`                       |                  | Print the workflow JSON Schema.                                     |
 | `plan --workflow F (-n NAME \| -r RE)`  | `p`              | Compile workflow → execution-plan JSON on stdout.                   |
-| `execute [-f PATH] [-w N] [--no-stdout] [--no-stderr] [--no-tui]` | `exec`, `x` | Run a plan. Reads stdin or `--file`. TUI when stdin AND stderr are TTYs. |
+| `execute [-f PATH] [-w N] [--no-stdout] [--no-stderr] [--no-tui]` | `exec`, `x` | Run a plan. Reads stdin or `--file`. TUI when stderr is a TTY. |
 | `list --workflow F [-o json\|json+p\|custom]` | `ls`, `l`  | List all nodes.                                                     |
 | `lint --workflow F [-o text\|json]`     |                  | Validate the workflow (exits 1 on errors).                          |
 | `describe --workflow F (-n NAME \| -r RE) [--pretty]` | `desc`, `d` | Print DAG waves as JSON.                                |
@@ -307,7 +307,8 @@ transitive prerequisite.
 
 ## Environment variable precedence
 
-Later scopes override earlier ones, key by key:
+Later scopes override earlier ones, key by key. The compiler bakes the merged map
+into each planned task; execute does not merge again:
 
 ```
 workflow.env   →   node.env   →   matrix-cell.env (per invocation)   →   task.env
@@ -318,7 +319,7 @@ Within each scope, explicit `vars` are merged first, and any env vars matching `
 
 ## Execution TUI
 
-`neomake execute` is auto-interactive: when stdin AND stderr are both TTYs, the execution
+`neomake execute` is auto-interactive: when stderr is a TTY, the execution
 runs under a ratatui-based TUI rendered to the alternate stderr screen. Layout:
 
 ```
@@ -497,7 +498,7 @@ neomake plan -n release:cratesio -a version="$VERSION" -a signer="$SIGNER" | neo
 
 Tools required for the release flow:
 - Rust toolchain (`cargo`, `rustc`, `rustup`)
-- [`cross`](https://github.com/cross-rs/cross) — cross-compilation
+- [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) and [Zig](https://ziglang.org/) — cross-compilation
 - [`gh`](https://cli.github.com/) — GitHub releases
 - `gpg` — asset signing
 - `tar` — tarball creation
