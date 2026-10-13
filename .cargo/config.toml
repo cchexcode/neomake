@@ -1,5 +1,10 @@
 [build]
 rustflags = ["-C", "target-feature=+crt-static"]
 
+# Zig's bundled glibc cannot be statically linked when cross-compiling.
+# These flags replace [build].rustflags for GNU targets. Musl stays static.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))']
+rustflags = ["-C", "target-feature=-crt-static"]
+
 [registries.crates-io]
 protocol = "sparse"

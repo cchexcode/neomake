@@ -498,9 +498,10 @@ cargo +nightly fmt
 Dogfood: neomake's own release pipeline is a neomake workflow. For example:
 
 ```bash
-neomake plan -n release:github -a version="$VERSION" -a signer="$SIGNER" | neomake x
-neomake plan -n release:cratesio -a version="$VERSION" -a signer="$SIGNER" | neomake x
+neomake plan -n release:github -n release:cratesio -a version="$VERSION" -a signer="$SIGNER" -a dry=true | neomake x
 ```
+
+`dry` is required and must be `true` or `false`. `true` checks the release without tagging, creating the GitHub release, or publishing to crates.io. A real release uses `-a dry=false`. Both publish nodes run in the last wave, after every asset exists.
 
 Tools required for the release flow:
 - Rust toolchain (`cargo`, `rustc`, `rustup`)
