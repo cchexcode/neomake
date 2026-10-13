@@ -19,6 +19,9 @@ crates/neomake/src/
   args.rs         CLI parsing (clap builder) into the `Command` enum. Privilege check gates
                   experimental commands. Does not compile or execute.
   cancel.rs       Shared cooperative `Cancel`. `trip` wakes every waiter; no poll loop.
+  kill.rs         Hard stop. `Control` tracks live process groups; `stop_one` / `stop_all`
+                  SIGKILL the group and return without waiting, so a hung child cannot
+                  block a TUI event loop. Children are spawned with `process_group(0)`.
   reference.rs    Manpages (clap_mangen), markdown docs (clap-markdown), shell completions
                   (clap_complete). Drives `man` and `autocomplete` subcommands.
   workflow.rs     HOCON source model only: Workflow / Env / Node / Matrix / Task /
@@ -40,7 +43,10 @@ crates/neomake/src/
   tui/mod.rs      Terminal setup (alternate screen on stderr, raw mode) and the async event
                   loop driving the execution TUI. `EventStream` for keyboard input; works
                   with piped stdin because crossterm's `use-dev-tty` backend reads keys from
-                  /dev/tty rather than stdin.
+                  /dev/tty rather than stdin. Log bursts are drained into one frame so a
+                  noisy task cannot stall key handling. `x` hard-stops the selected batch,
+                  `X` hard-stops every batch, `q` / Ctrl+C hard-stop and leave (second press
+                  or 1s forces the TUI closed).
   tui/app.rs      TUI state: ordered batch list, per-batch status and log buffer (capped at
                   5000 lines), cursor, follow mode, wave counters. `apply(ExecEvent)` drives
                   state transitions from engine events.
@@ -54,7 +60,7 @@ crates/neomake/src/
                     behind `-e/--experimental`.
   multiplex/tui/    Semi-interactive ratatui TUI for `multiplex`, mirroring the execute TUI:
                     task tree left, log pane right, hotkey bar, help overlay. Same keybindings
-                    as the execute TUI (j/k, Ctrl+d/u, g/G, f, ?, q, Ctrl+C).
+                    as the execute TUI (j/k, Ctrl+d/u, g/G, f, x/X, ?, q, Ctrl+C).
 
 crates/neomake/res/templates/
   min.neomake.conf      Minimal HOCON template (used by `workflow init -t min`)
@@ -273,11 +279,14 @@ with `mod.rs` (mirroring `qb`'s `k8s/` and `tui/` pattern). Until then, prefer f
 - `runner.rs` — Driver selection and summary rendering. Does not compile.
 - `tui/` — Execute TUI. Does not spawn.
 - `multiplex/` — Multiplexer and watch. Does not import the plan or the runner.
-- `cancel.rs` — Shared cancellation. Both engines use it.
+- `cancel.rs` — Shared cooperative cancellation. Both engines use it.
+- `kill.rs` — Hard stop of live process groups. Does not wait on children. Both
+  engines and both TUIs use it. Do not await process exit on a stop path.
 - `reference.rs` — Output-only (docs + completions).
 - `args.rs` — Input-only. Paths are `PathBuf`, worker counts are `NonZeroUsize`.
 - Dependency direction is acyclic: `args`/`main` → `plan` → `workflow`; `exec` → `plan`;
-  `runner` → `exec` + `tui`; `multiplex` does not depend on `runner`.
+  `runner` → `exec` + `tui`; `multiplex` does not depend on `runner`. `kill` is a leaf
+  used by both engines and both TUIs.
 
 ### Enum-driven dispatch
 

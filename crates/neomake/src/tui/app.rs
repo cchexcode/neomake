@@ -63,6 +63,7 @@ pub struct App {
     pub show_help: bool,
     pub quit: bool,
     pub quit_requested: bool,
+    pub quit_requested_at: Option<Instant>,
 }
 
 impl App {
@@ -83,6 +84,7 @@ impl App {
             show_help: false,
             quit: false,
             quit_requested: false,
+            quit_requested_at: None,
         }
     }
 
@@ -226,8 +228,42 @@ impl App {
     }
 
     pub fn request_quit_after_finish(&mut self) {
+        if self.quit_requested_at.is_none() {
+            self.quit_requested_at = Some(Instant::now());
+        }
         self.quit_requested = true;
         if self.exec_finished {
+            self.quit = true;
+        }
+    }
+
+    /// Mark a still-running batch stopped so the tree updates before the
+    /// engine reports. Already-finished batches are left alone.
+    pub fn note_stopped(&mut self, key: &BatchKey) {
+        let Some(batch) = self.batches.get_mut(key) else {
+            return;
+        };
+        if matches!(batch.state, BatchState::Pending | BatchState::Running) {
+            batch.state = BatchState::Failed;
+            batch.failure = Some("stopped".to_owned());
+            batch.current_command = None;
+        }
+    }
+
+    pub fn note_stopped_all(&mut self) {
+        let keys: Vec<BatchKey> = self.order.clone();
+        for key in keys {
+            self.note_stopped(&key);
+        }
+        self.aborted = true;
+    }
+
+    pub fn note_engine_closed(&mut self) {
+        if !self.exec_finished {
+            self.exec_finished = true;
+            self.finished_at = Some(Instant::now());
+        }
+        if self.quit_requested {
             self.quit = true;
         }
     }

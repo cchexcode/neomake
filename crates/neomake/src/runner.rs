@@ -7,6 +7,7 @@ use {
             ExecEngine,
             ExecEvent,
         },
+        kill::Control,
         plan::ExecutionPlan,
     },
     anyhow::{
@@ -42,7 +43,8 @@ pub async fn execute(plan: ExecutionPlan, workers: usize, tui: bool, plain: Plai
         );
     }
 
-    let cancel = Cancel::new();
+    let control = Control::<BatchKey>::new(Cancel::new());
+    crate::kill::arm_exit_signals(control.clone());
     let (tx, rx) = unbounded_channel::<ExecEvent>();
 
     // Tee events into the summary collector when requested. Both drivers and the
@@ -56,7 +58,7 @@ pub async fn execute(plan: ExecutionPlan, workers: usize, tui: bool, plain: Plai
         (rx, None)
     };
 
-    let engine = ExecEngine::new(workers)?.with_cancel(cancel.clone());
+    let engine = ExecEngine::new(workers)?.with_control(control.clone());
     let plan_for_engine = plan.clone();
     let engine_handle = tokio::spawn(async move { engine.run(&plan_for_engine, tx).await });
 
@@ -67,11 +69,20 @@ pub async fn execute(plan: ExecutionPlan, workers: usize, tui: bool, plain: Plai
             eprintln!("TUI disabled ({}); using plain driver.", e);
             run_plain(rx_driver, plain).await
         } else {
-            crate::tui::run(rx_driver, cancel.clone()).await
+            crate::tui::run(rx_driver, control.clone()).await
         }
     } else {
         run_plain(rx_driver, plain).await
     };
+
+    if control.forced() {
+        control.stop_all();
+        engine_handle.abort();
+        if let Some(handle) = summary_handle {
+            handle.abort();
+        }
+        return Err(anyhow!("execution aborted"));
+    }
 
     if let Some(handle) = summary_handle {
         if let Ok(data) = handle.await {

@@ -44,7 +44,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let (done, total) = app.wave_progress();
     let secs = app.elapsed().as_secs();
-    let status = if app.aborted {
+    let status = if app.quit_requested && !app.exec_finished {
+        " STOPPING".to_owned()
+    } else if app.aborted {
         " ABORTED".to_owned()
     } else if app.exec_finished {
         if app.failed_batches == 0 {
@@ -173,10 +175,10 @@ fn render_hotkeys(f: &mut Frame, area: Rect, _app: &App) {
     let hotkeys = Line::from(vec![
         Span::styled(" j/k ", Style::default().fg(Color::Cyan)),
         Span::raw("nav "),
+        Span::styled("x/X ", Style::default().fg(Color::Cyan)),
+        Span::raw("stop "),
         Span::styled("Ctrl+d/u ", Style::default().fg(Color::Cyan)),
         Span::raw("page "),
-        Span::styled("g/G ", Style::default().fg(Color::Cyan)),
-        Span::raw("top/bot "),
         Span::styled("f ", Style::default().fg(Color::Cyan)),
         Span::raw("follow "),
         Span::styled("? ", Style::default().fg(Color::Cyan)),
@@ -188,7 +190,7 @@ fn render_hotkeys(f: &mut Frame, area: Rect, _app: &App) {
 }
 
 fn render_help(f: &mut Frame) {
-    let area = centered_rect(60, 50, f.area());
+    let area = centered_rect(72, 70, f.area());
     let lines = vec![
         Line::from("Navigation"),
         Line::from("  j / k, Down / Up      move cursor"),
@@ -197,8 +199,10 @@ fn render_help(f: &mut Frame) {
         Line::from("  f                     toggle follow mode"),
         Line::from(""),
         Line::from("Execution"),
-        Line::from("  q                     quit (cancels if still running)"),
-        Line::from("  Ctrl+c                cancel execution"),
+        Line::from("  x                     hard-stop selected task"),
+        Line::from("  X                     hard-stop all tasks"),
+        Line::from("  q                     quit (hard-stops; again forces exit)"),
+        Line::from("  Ctrl+c                hard-stop all and quit"),
         Line::from(""),
         Line::from("  ?                     toggle this help"),
         Line::from("  Esc                   close help"),

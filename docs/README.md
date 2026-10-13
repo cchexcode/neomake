@@ -331,13 +331,18 @@ runs under a ratatui-based TUI rendered to the alternate stderr screen. Layout:
 │  w2  ● package                    │                                           │
 │ ...                               │                                           │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│ j/k nav · Ctrl+d/u page · g/G top/bot · f follow · ? help · q quit           │
+│ j/k nav · x/X stop · f follow · ? help · q quit                              │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Keybindings: `j/k` / `Up/Down` move the cursor; `Ctrl+d/u` and `PgUp/PgDn` page the logs;
 `g/G` / `Home/End` jump to top/bottom of the log pane; `f` toggles follow mode; `?` shows
-help; `q` quits (cancels a running plan if still in progress); `Ctrl+C` cancels immediately.
+help. `x` hard-stops the selected batch; `X` hard-stops every batch and cancels the rest
+of the plan. `q` and `Ctrl+C` hard-stop everything and leave — a second press, or one
+second with no engine progress, closes the TUI anyway so a wedged child cannot trap the
+session. Hard stop SIGKILLs the child process group and returns immediately; it does not
+wait for the process to exit. For container tasks that is the runtime client, not a
+`docker kill` of an already-detached container.
 
 The engine keeps running in the background on a tokio runtime — each batch is a
 `tokio::process::Command` with piped stdout/stderr captured line-by-line and fed into the
@@ -445,8 +450,9 @@ The `multiplex` subcommand is a host-only runner; containers are a workflow feat
   line-by-line and emitted as `MuxEvent`s on an mpsc channel.
 - On a terminal, a ratatui TUI renders the same two-pane layout as `execute`: task tree on
   the left (status glyph + command snippet + duration), log pane on the right (stderr
-  highlighted in red, follow mode, page/top/bottom scrolling, help overlay). `q` cancels
-  in-flight children and exits; `Ctrl+C` cancels immediately.
+  highlighted in red, follow mode, page/top/bottom scrolling, help overlay). `x` hard-stops
+  the selected task; `X` hard-stops every task. `q` / `Ctrl+C` hard-stop and exit (a second
+  press forces the TUI closed). The same keys apply to the execute TUI.
 - Off-terminal (piped, CI, `--no-tui`), a plain line-oriented driver prefixes each line
   with `[id]` and summarises each task on completion.
 - `--stdout` emits a deterministic JSON blob with per-task stdout and RFC 3339 timestamps —

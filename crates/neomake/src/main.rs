@@ -9,6 +9,7 @@ use {
 mod args;
 mod cancel;
 mod exec;
+mod kill;
 mod multiplex;
 mod plan;
 mod reference;

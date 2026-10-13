@@ -3,7 +3,10 @@ pub mod ui;
 
 use {
     crate::{
-        cancel::Cancel,
+        kill::{
+            Control,
+            FORCE_QUIT_AFTER,
+        },
         multiplex::MuxEvent,
     },
     anyhow::Result,
@@ -30,19 +33,22 @@ use {
         io,
         time::Duration,
     },
-    tokio::sync::mpsc::UnboundedReceiver,
+    tokio::sync::mpsc::{
+        error::TryRecvError,
+        UnboundedReceiver,
+    },
 };
 
 /// Drive the multiplex TUI. Returns on user quit, engine completion, or
 /// cancellation.
-pub async fn run(rx: UnboundedReceiver<MuxEvent>, cancel: Cancel) -> Result<()> {
+pub async fn run(rx: UnboundedReceiver<MuxEvent>, control: Control<usize>) -> Result<()> {
     enable_raw_mode()?;
     let mut stderr = io::stderr();
     execute!(stderr, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stderr);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = event_loop(&mut terminal, rx, cancel).await;
+    let result = event_loop(&mut terminal, rx, control).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -61,34 +67,42 @@ pub fn probe_event_reader() -> std::io::Result<()> {
 async fn event_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     mut rx: UnboundedReceiver<MuxEvent>,
-    cancel: Cancel,
+    control: Control<usize>,
 ) -> Result<()> {
     let mut app = app::App::new();
     let mut key_stream = EventStream::new();
     let tick = Duration::from_millis(100);
+    let mut engine_open = true;
 
     loop {
+        if engine_open {
+            engine_open = drain_mux(&mut app, &mut rx);
+        }
         terminal.draw(|f| ui::render(f, &mut app))?;
 
         tokio::select! {
             biased;
             maybe_key = key_stream.next() => {
                 if let Some(Ok(Event::Key(k))) = maybe_key {
-                    handle_key(&mut app, k, &cancel);
+                    handle_key(&mut app, k, &control);
                 }
             }
-            ev = rx.recv() => {
+            ev = rx.recv(), if engine_open => {
                 match ev {
-                    | Some(e) => app.apply(e),
+                    | Some(e) => {
+                        app.apply(e);
+                        engine_open = drain_mux(&mut app, &mut rx);
+                    },
                     | None => {
-                        terminal.draw(|f| ui::render(f, &mut app))?;
-                        app.engine_finished = true;
-                    }
+                        engine_open = false;
+                        app.note_engine_closed();
+                    },
                 }
             }
             _ = tokio::time::sleep(tick) => {}
         }
 
+        poll_force_quit(&mut app, &control);
         if app.quit {
             break;
         }
@@ -96,23 +110,54 @@ async fn event_loop<B: Backend>(
     Ok(())
 }
 
-fn handle_key(app: &mut app::App, ev: KeyEvent, cancel: &Cancel) {
+fn drain_mux(app: &mut app::App, rx: &mut UnboundedReceiver<MuxEvent>) -> bool {
+    loop {
+        match rx.try_recv() {
+            | Ok(ev) => app.apply(ev),
+            | Err(TryRecvError::Empty) => return true,
+            | Err(TryRecvError::Disconnected) => {
+                app.note_engine_closed();
+                return false;
+            },
+        }
+    }
+}
+
+fn poll_force_quit(app: &mut app::App, control: &Control<usize>) {
+    if app.quit || app.engine_finished {
+        return;
+    }
+    if let Some(at) = app.quit_requested_at {
+        if at.elapsed() >= FORCE_QUIT_AFTER {
+            control.force_quit();
+            app.quit = true;
+        }
+    }
+}
+
+fn handle_key(app: &mut app::App, ev: KeyEvent, control: &Control<usize>) {
     if ev.kind != KeyEventKind::Press {
         return;
     }
     let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
     match ev.code {
-        | KeyCode::Char('c') if ctrl => {
-            cancel.trip();
-            app.request_quit_after_finish();
-        },
+        | KeyCode::Char('c') if ctrl => hard_stop_and_quit(app, control),
         | KeyCode::Char('q') => {
             if app.engine_finished {
                 app.quit = true;
             } else {
-                cancel.trip();
-                app.request_quit_after_finish();
+                hard_stop_and_quit(app, control);
             }
+        },
+        | KeyCode::Char('x') => {
+            if let Some(id) = app.selected_id() {
+                control.stop_one(&id);
+                app.note_stopped(id);
+            }
+        },
+        | KeyCode::Char('X') => {
+            control.stop_all();
+            app.note_stopped_all();
         },
         | KeyCode::Char('j') | KeyCode::Down => app.cursor_down(),
         | KeyCode::Char('k') | KeyCode::Up => app.cursor_up(),
@@ -127,4 +172,15 @@ fn handle_key(app: &mut app::App, ev: KeyEvent, cancel: &Cancel) {
         | KeyCode::Esc => app.dismiss_help(),
         | _ => {},
     }
+}
+
+fn hard_stop_and_quit(app: &mut app::App, control: &Control<usize>) {
+    if app.quit_requested {
+        control.force_quit();
+        app.quit = true;
+        return;
+    }
+    control.stop_all();
+    app.note_stopped_all();
+    app.request_quit_after_finish();
 }

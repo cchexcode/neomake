@@ -1,6 +1,12 @@
 use {
     crate::{
         cancel::Cancel,
+        kill::{
+            arm,
+            drive_child,
+            ChildEnd,
+            Control,
+        },
         plan::{
             ExecutionPlan,
             PlannedTask,
@@ -219,7 +225,7 @@ impl OutputCollector {
 /// print.
 pub struct ExecEngine {
     workers: usize,
-    pub cancel: Cancel,
+    control: Control<BatchKey>,
     runtime: RuntimeResolver,
     host: HostContext,
 }
@@ -259,14 +265,14 @@ impl ExecEngine {
     pub fn new(workers: usize) -> Result<Self> {
         Ok(Self {
             workers: workers.max(1),
-            cancel: Cancel::new(),
+            control: Control::new(Cancel::new()),
             runtime: RuntimeResolver::default(),
             host: HostContext::capture()?,
         })
     }
 
-    pub fn with_cancel(mut self, cancel: Cancel) -> Self {
-        self.cancel = cancel;
+    pub fn with_control(mut self, control: Control<BatchKey>) -> Self {
+        self.control = control;
         self
     }
 
@@ -306,7 +312,7 @@ impl ExecEngine {
         let mut aborted = false;
 
         for (wave_idx, stage) in plan.stages.iter().enumerate() {
-            if self.cancel.tripped() {
+            if self.control.cancel.tripped() || self.control.stops.all_stopped() {
                 aborted = true;
                 break;
             }
@@ -336,25 +342,30 @@ impl ExecEngine {
                 let sem = sem.clone();
                 let key = info.key.clone();
                 let tx = tx.clone();
-                let cancel = self.cancel.clone();
+                let control = self.control.clone();
                 let collector = collector.clone();
                 let runtime = self.runtime.clone();
                 let host = self.host.clone();
                 joins.spawn(async move {
+                    let stop_key = key.clone();
                     let permit = tokio::select! {
                         biased;
-                        _ = cancel.cancelled() => {
-                            emit_cancelled(&tx, key);
+                        _ = control.cancel.cancelled() => {
+                            emit_halted(&tx, key, &control);
+                            return false;
+                        }
+                        _ = control.stops.stopped(&stop_key) => {
+                            emit_halted(&tx, key, &control);
                             return false;
                         }
                         acquired = sem.acquire_owned() => acquired,
                     };
                     let Ok(_permit) = permit else {
-                        emit_cancelled(&tx, key);
+                        emit_halted(&tx, key, &control);
                         return false;
                     };
-                    if cancel.tripped() {
-                        emit_cancelled(&tx, key);
+                    if control.cancel.tripped() || control.stops.is_stopped(&key) {
+                        emit_halted(&tx, key, &control);
                         return false;
                     }
                     run_batch(
@@ -362,7 +373,7 @@ impl ExecEngine {
                             host,
                             runtime,
                             tx,
-                            cancel,
+                            control,
                             collector,
                         },
                         key,
@@ -384,7 +395,7 @@ impl ExecEngine {
                 failures: wave_failures,
             });
             failed_batches += wave_failures;
-            if self.cancel.tripped() {
+            if self.control.cancel.tripped() || self.control.stops.all_stopped() {
                 aborted = true;
             }
             if wave_failures > 0 || aborted {
@@ -447,12 +458,12 @@ impl ExecEngine {
     }
 }
 
-fn emit_cancelled(tx: &UnboundedSender<ExecEvent>, key: BatchKey) {
+fn emit_halted(tx: &UnboundedSender<ExecEvent>, key: BatchKey, control: &Control<BatchKey>) {
     let _ = tx.send(ExecEvent::BatchCompleted {
-        key,
+        key: key.clone(),
         status: BatchStatus::Failed {
             code: None,
-            message: "cancelled".to_owned(),
+            message: control.halt_message(&key).to_owned(),
         },
         duration_ms: 0,
     });
@@ -462,7 +473,7 @@ struct RunCtx {
     host: HostContext,
     runtime: RuntimeResolver,
     tx: UnboundedSender<ExecEvent>,
-    cancel: Cancel,
+    control: Control<BatchKey>,
     collector: OutputCollector,
 }
 
@@ -471,18 +482,18 @@ async fn run_batch(ctx: RunCtx, key: BatchKey, batch: Vec<Work>, stdin_blob: Opt
         host,
         runtime,
         tx,
-        cancel,
+        control,
         collector,
     } = ctx;
     let start = Instant::now();
     let mut per_invocation_stdout = BTreeMap::<usize, String>::new();
 
     for work in batch {
-        if cancel.tripped() {
-            emit_cancelled(&tx, key);
+        if control.cancel.tripped() || control.stops.is_stopped(&key) {
+            emit_halted(&tx, key, &control);
             return false;
         }
-        match run_work_with_retry(&host, &runtime, &key, &work, stdin_blob.as_deref(), &tx, &cancel).await {
+        match run_work_with_retry(&host, &runtime, &key, &work, stdin_blob.as_deref(), &tx, &control).await {
             | Ok(stdout) => {
                 per_invocation_stdout
                     .entry(work.invocation_idx)
@@ -523,22 +534,28 @@ async fn run_work_with_retry(
     work: &Work,
     stdin_blob: Option<&str>,
     tx: &UnboundedSender<ExecEvent>,
-    cancel: &Cancel,
+    control: &Control<BatchKey>,
 ) -> std::result::Result<String, BatchStatus> {
     let attempts = work.retry.as_ref().map(|policy| policy.attempts.max(1)).unwrap_or(1);
     let mut last_failure = None;
 
     for attempt in 1..=attempts {
-        if cancel.tripped() {
+        if control.cancel.tripped() || control.stops.is_stopped(key) {
             return Err(BatchStatus::Failed {
                 code: None,
-                message: "cancelled".to_owned(),
+                message: control.halt_message(key).to_owned(),
             });
         }
-        match run_one(host, runtime, key, work, stdin_blob, tx, cancel).await {
+        match run_one(host, runtime, key, work, stdin_blob, tx, control).await {
             | Ok(stdout) => return Ok(stdout),
             | Err(status) => {
                 last_failure = Some(status);
+                if control.cancel.tripped() || control.stops.is_stopped(key) {
+                    return Err(BatchStatus::Failed {
+                        code: None,
+                        message: control.halt_message(key).to_owned(),
+                    });
+                }
                 if attempt < attempts {
                     if let Some(policy) = &work.retry {
                         let delay = policy.delay_after(attempt);
@@ -550,7 +567,22 @@ async fn run_work_with_retry(
                                 delay.as_millis()
                             ),
                         });
-                        tokio::time::sleep(delay).await;
+                        tokio::select! {
+                            biased;
+                            _ = control.stops.stopped(key) => {
+                                return Err(BatchStatus::Failed {
+                                    code: None,
+                                    message: "stopped".to_owned(),
+                                });
+                            }
+                            _ = control.cancel.cancelled() => {
+                                return Err(BatchStatus::Failed {
+                                    code: None,
+                                    message: control.halt_message(key).to_owned(),
+                                });
+                            }
+                            _ = tokio::time::sleep(delay) => {}
+                        }
                     }
                 }
             },
@@ -572,7 +604,7 @@ async fn run_one(
     work: &Work,
     stdin_blob: Option<&str>,
     tx: &UnboundedSender<ExecEvent>,
-    cancel: &Cancel,
+    control: &Control<BatchKey>,
 ) -> std::result::Result<String, BatchStatus> {
     let _ = tx.send(ExecEvent::BatchStarted {
         key: key.clone(),
@@ -609,6 +641,7 @@ async fn run_one(
             build_container_command(runtime_bin, container, work, host, shell_program, &shell_args)
         },
     };
+    arm(&mut cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     if stdin_blob.is_some() {
         cmd.stdin(Stdio::piped());
@@ -651,34 +684,33 @@ async fn run_one(
         }
     });
 
-    let status = tokio::select! {
-        status = child.wait() => status,
-        _ = cancel.cancelled() => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            Err(std::io::Error::other("cancelled"))
-        },
-    };
-    let collected_stdout = stdout_task.await.unwrap_or_default();
-    let _ = stderr_task.await;
-
-    match status {
-        | Ok(status) if status.success() => Ok(collected_stdout),
-        | Ok(status) => {
-            let code = status.code();
-            Err(BatchStatus::Failed {
-                code,
-                message: format!(
-                    "exit {}",
-                    code.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_owned())
-                ),
-            })
-        },
-        | Err(err) => {
+    match drive_child(child, key.clone(), control, stdout_task, stderr_task).await {
+        | ChildEnd::Stopped => {
             Err(BatchStatus::Failed {
                 code: None,
-                message: err.to_string(),
+                message: "stopped".to_owned(),
             })
+        },
+        | ChildEnd::Exited { status, stdout } => {
+            match status {
+                | Ok(status) if status.success() => Ok(stdout),
+                | Ok(status) => {
+                    let code = status.code();
+                    Err(BatchStatus::Failed {
+                        code,
+                        message: format!(
+                            "exit {}",
+                            code.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_owned())
+                        ),
+                    })
+                },
+                | Err(err) => {
+                    Err(BatchStatus::Failed {
+                        code: None,
+                        message: err.to_string(),
+                    })
+                },
+            }
         },
     }
 }
@@ -783,4 +815,81 @@ fn build_container_command(
 extern "C" {
     fn getuid() -> u32;
     fn getgid() -> u32;
+}
+
+#[cfg(all(test, unix))]
+mod test {
+    use {
+        super::{
+            ExecEngine,
+            ExecEvent,
+        },
+        crate::{
+            cancel::Cancel,
+            kill::Control,
+            plan::{
+                ExecutionPlan,
+                PlannedInvocation,
+                PlannedNode,
+                PlannedTask,
+                ShellSpec,
+                Stage,
+            },
+        },
+        std::{
+            collections::BTreeMap,
+            time::Duration,
+        },
+        tokio::sync::mpsc::unbounded_channel,
+    };
+
+    fn hang_plan() -> ExecutionPlan {
+        ExecutionPlan {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            stages: vec![Stage {
+                nodes: vec!["hang".to_owned()],
+            }],
+            nodes: BTreeMap::from([("hang".to_owned(), PlannedNode {
+                parallel: false,
+                deps: Vec::new(),
+                inputs: Vec::new(),
+                invocations: vec![PlannedInvocation {
+                    cell: Vec::new(),
+                    tasks: vec![PlannedTask {
+                        cmd: "sleep 60".to_owned(),
+                        shell: ShellSpec::sh(),
+                        env: BTreeMap::new(),
+                        workdir: None,
+                        retry: None,
+                        container: None,
+                    }],
+                }],
+            })]),
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_one_unblocks_a_hung_batch() {
+        let control = Control::new(Cancel::new());
+        let engine = ExecEngine::new(1).expect("engine").with_control(control.clone());
+        let plan = hang_plan();
+        let (tx, mut rx) = unbounded_channel();
+        let handle = tokio::spawn(async move { engine.run(&plan, tx).await });
+
+        let key = loop {
+            match rx.recv().await {
+                | Some(ExecEvent::BatchStarted { key, .. }) => break key,
+                | Some(ExecEvent::Finished { .. }) => panic!("finished before the batch started"),
+                | Some(_) => {},
+                | None => panic!("engine closed the event channel"),
+            }
+        };
+        control.stop_one(&key);
+
+        let joined = tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("engine stayed blocked after stop");
+        let ok = joined.expect("engine panicked").expect("engine error");
+        assert!(!ok);
+    }
 }

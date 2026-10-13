@@ -57,6 +57,7 @@ pub struct App {
     pub show_help: bool,
     pub quit: bool,
     pub quit_requested: bool,
+    pub quit_requested_at: Option<Instant>,
 }
 
 impl App {
@@ -75,6 +76,7 @@ impl App {
             show_help: false,
             quit: false,
             quit_requested: false,
+            quit_requested_at: None,
         }
     }
 
@@ -203,8 +205,39 @@ impl App {
     }
 
     pub fn request_quit_after_finish(&mut self) {
+        if self.quit_requested_at.is_none() {
+            self.quit_requested_at = Some(Instant::now());
+        }
         self.quit_requested = true;
         if self.engine_finished {
+            self.quit = true;
+        }
+    }
+
+    pub fn note_stopped(&mut self, id: usize) {
+        let Some(task) = self.tasks.get_mut(&id) else {
+            return;
+        };
+        if matches!(task.state, TaskState::Pending | TaskState::Running) {
+            task.state = TaskState::Failed;
+            task.failure = Some("stopped".to_owned());
+        }
+    }
+
+    pub fn note_stopped_all(&mut self) {
+        let ids: Vec<usize> = self.order.clone();
+        for id in ids {
+            self.note_stopped(id);
+        }
+        self.aborted = true;
+    }
+
+    pub fn note_engine_closed(&mut self) {
+        if !self.engine_finished {
+            self.engine_finished = true;
+            self.finished_at = Some(Instant::now());
+        }
+        if self.quit_requested {
             self.quit = true;
         }
     }

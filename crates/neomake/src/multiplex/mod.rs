@@ -1,7 +1,15 @@
 pub mod tui;
 
 use {
-    crate::cancel::Cancel,
+    crate::{
+        cancel::Cancel,
+        kill::{
+            arm,
+            drive_child,
+            ChildEnd,
+            Control,
+        },
+    },
     anyhow::{
         anyhow,
         bail,
@@ -116,7 +124,7 @@ pub struct Multiplexer {
     program: Vec<String>,
     commands: Vec<String>,
     parallelism: usize,
-    pub cancel: Cancel,
+    control: Control<usize>,
 }
 
 impl Multiplexer {
@@ -125,12 +133,12 @@ impl Multiplexer {
             program,
             commands,
             parallelism: parallelism.max(1),
-            cancel: Cancel::new(),
+            control: Control::new(Cancel::new()),
         }
     }
 
-    pub fn with_cancel(mut self, cancel: Cancel) -> Self {
-        self.cancel = cancel;
+    pub fn with_control(mut self, control: Control<usize>) -> Self {
+        self.control = control;
         self
     }
 
@@ -161,23 +169,27 @@ impl Multiplexer {
             let command_str = info.command.clone();
             let program = self.program.clone();
             let tx = tx.clone();
-            let cancel = self.cancel.clone();
+            let control = self.control.clone();
             let budget = budget.clone();
 
             joins.spawn(async move {
                 let permit = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => {
-                        emit_cancelled(&tx, id);
+                    _ = control.cancel.cancelled() => {
+                        emit_halted(&tx, id, &control);
+                        return (id, false, String::new());
+                    }
+                    _ = control.stops.stopped(&id) => {
+                        emit_halted(&tx, id, &control);
                         return (id, false, String::new());
                     }
                     acquired = budget.acquire_owned() => acquired,
                 };
-                if permit.is_err() || cancel.tripped() {
-                    emit_cancelled(&tx, id);
+                if permit.is_err() || control.cancel.tripped() || control.stops.is_stopped(&id) {
+                    emit_halted(&tx, id, &control);
                     return (id, false, String::new());
                 }
-                run_task(id, program, command_str, tx, cancel).await
+                run_task(id, program, command_str, tx, control).await
             });
         }
 
@@ -195,13 +207,10 @@ impl Multiplexer {
             }
         }
 
-        let _ = tx.send(MuxEvent::Finished {
-            failed,
-            aborted: self.cancel.tripped(),
-        });
+        let aborted = self.control.cancel.tripped() || self.control.stops.all_stopped();
+        let _ = tx.send(MuxEvent::Finished { failed, aborted });
 
         let ended = Timestamp::now();
-        let aborted = self.cancel.tripped();
         let mut data = MultiplexerResult {
             metadata: MultiplexerResultMetadata { started, ended },
             failed,
@@ -221,7 +230,7 @@ async fn run_task(
     program: Vec<String>,
     command_str: String,
     tx: UnboundedSender<MuxEvent>,
-    cancel: Cancel,
+    control: Control<usize>,
 ) -> (usize, bool, String) {
     let start = Instant::now();
     let _ = tx.send(MuxEvent::TaskStarted { id });
@@ -235,6 +244,7 @@ async fn run_task(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    arm(&mut cmd);
 
     let mut child = match cmd.spawn() {
         | Ok(c) => c,
@@ -277,34 +287,45 @@ async fn run_task(
         }
     });
 
-    let status = tokio::select! {
-        s = child.wait() => s,
-        _ = cancel.cancelled() => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            Err(std::io::Error::other("cancelled"))
+    let (ok, outcome, stdout_collected) = match drive_child(child, id, &control, stdout_task, stderr_task).await {
+        | ChildEnd::Stopped => {
+            (
+                false,
+                TaskStatus::Failed {
+                    code: None,
+                    message: "stopped".to_owned(),
+                },
+                String::new(),
+            )
         },
-    };
-    let stdout_collected = stdout_task.await.unwrap_or_default();
-    let _ = stderr_task.await;
-
-    let (ok, outcome) = match status {
-        | Ok(s) if s.success() => (true, TaskStatus::Success),
-        | Ok(s) => {
-            let code = s.code();
-            (false, TaskStatus::Failed {
-                code,
-                message: format!(
-                    "exit {}",
-                    code.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_owned())
-                ),
-            })
-        },
-        | Err(e) => {
-            (false, TaskStatus::Failed {
-                code: None,
-                message: format!("{}", e),
-            })
+        | ChildEnd::Exited { status, stdout } => {
+            match status {
+                | Ok(s) if s.success() => (true, TaskStatus::Success, stdout),
+                | Ok(s) => {
+                    let code = s.code();
+                    (
+                        false,
+                        TaskStatus::Failed {
+                            code,
+                            message: format!(
+                                "exit {}",
+                                code.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_owned())
+                            ),
+                        },
+                        stdout,
+                    )
+                },
+                | Err(e) => {
+                    (
+                        false,
+                        TaskStatus::Failed {
+                            code: None,
+                            message: format!("{e}"),
+                        },
+                        stdout,
+                    )
+                },
+            }
         },
     };
 
@@ -316,12 +337,12 @@ async fn run_task(
     (id, ok, stdout_collected)
 }
 
-fn emit_cancelled(tx: &UnboundedSender<MuxEvent>, id: usize) {
+fn emit_halted(tx: &UnboundedSender<MuxEvent>, id: usize, control: &Control<usize>) {
     let _ = tx.send(MuxEvent::TaskCompleted {
         id,
         status: TaskStatus::Failed {
             code: None,
-            message: "cancelled".to_owned(),
+            message: control.halt_message(&id).to_owned(),
         },
         duration_ms: 0,
     });
@@ -341,9 +362,10 @@ pub async fn run(
     tui: bool,
 ) -> Result<()> {
     let parallelism = parallelism.unwrap_or_else(|| commands.len().max(1));
-    let cancel = Cancel::new();
+    let control = Control::new(Cancel::new());
+    crate::kill::arm_exit_signals(control.clone());
     let (tx, rx) = unbounded_channel::<MuxEvent>();
-    let mux = Multiplexer::new(program, commands, parallelism).with_cancel(cancel.clone());
+    let mux = Multiplexer::new(program, commands, parallelism).with_control(control.clone());
     let engine_handle = tokio::spawn(async move { mux.run(tx).await });
 
     if tui {
@@ -351,10 +373,16 @@ pub async fn run(
             eprintln!("TUI disabled ({}); using plain driver.", e);
             run_plain(rx).await?;
         } else {
-            tui::run(rx, cancel.clone()).await?;
+            tui::run(rx, control.clone()).await?;
         }
     } else {
         run_plain(rx).await?;
+    }
+
+    if control.forced() {
+        control.stop_all();
+        engine_handle.abort();
+        bail!("multiplex aborted");
     }
 
     let result = match engine_handle.await {
@@ -463,10 +491,12 @@ pub async fn watch(
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let pll = parallelism.max(1);
+    let control = Control::<usize>::new(Cancel::new());
+    let control_for_runs = control.clone();
     tokio::spawn(async move {
         while rx.recv().await.is_some() {
             let (ev_tx, ev_rx) = unbounded_channel::<MuxEvent>();
-            let mux = Multiplexer::new(program.clone(), commands.clone(), pll);
+            let mux = Multiplexer::new(program.clone(), commands.clone(), pll).with_control(control_for_runs.clone());
             let handle = tokio::spawn(async move { mux.run(ev_tx).await });
             if let Err(err) = run_plain(ev_rx).await {
                 eprintln!("watch run failed: {err:#}");
@@ -509,6 +539,9 @@ pub async fn watch(
     })
     .await
     .context("signal wait failed")?;
+    // Children are in their own process group, so the terminal's SIGINT does
+    // not reach them. Kill the group before the runtime drops the tasks.
+    control.stop_all();
     Ok(())
 }
 
